@@ -480,7 +480,10 @@ class TestFullRecoveryReset:
         assert code is None and reinit_ran
         assert [b for b, _ in host.ipmi] == ["0x2", "0xF"]
         assert host.ioctl_ids(IoctlResetFlags.POST_RESET)[-1] == list(range(32))
-        assert "Recount after round 2: 32/32 enumerated, 32/32 readable" in capsys.readouterr().out
+        assert (
+            "Recount after round 2: 32/32 enumerated, 32/32 readable"
+            in capsys.readouterr().out
+        )
 
     def test_chip_that_never_returns_is_a_hardware_fault(self, tmp_path, capsys):
         host = FakeGalaxy(tmp_path, states={self.LOST: "gone"})
