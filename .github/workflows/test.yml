@@ -65,5 +65,7 @@ jobs:
           pip install -e ".[test]"
 
       - name: Run hardware tests
+        env:
+          TT_SMI_HW_TESTS: "1"
         run: |
           pytest tests/ -v -m requires_hardware -m "not requires_galaxy"

@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import pytest
 
 from typing import List, Dict, Tuple, Union
@@ -10,6 +12,19 @@ from tt_umd import PCIDevice, TopologyDiscovery, TTDevice, TopologyDiscoveryOpti
 from tt_smi.backend import TTSMIBackend
 from tt_smi.constants import get_default_discovery_options
 from tt_tools_common.utils_common.tools_utils import detect_chips_with_callback
+
+HW_TESTS_ENV = "TT_SMI_HW_TESTS"
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip tests that touch real devices or the BMC (resets, ipmitool) unless TT_SMI_HW_TESTS=1."""
+    if os.environ.get(HW_TESTS_ENV) == "1":
+        return
+    skip = pytest.mark.skip(reason=f"needs real hardware; set {HW_TESTS_ENV}=1 to run")
+    for item in items:
+        if "requires_hardware" in item.keywords or "requires_galaxy" in item.keywords:
+            item.add_marker(skip)
+
 
 # Luwen fixtures
 
