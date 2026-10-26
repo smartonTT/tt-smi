@@ -340,7 +340,7 @@ def umd_pci_warm_reset(
     if not failed:
         print(
             CMD_LINE_COLOR.RED,
-            "UMD warm reset reported failure, but every chip reads back as reset.",
+            "UMD warm reset reported failure; no chip reads back as failed (the reset may not have run).",
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
         )

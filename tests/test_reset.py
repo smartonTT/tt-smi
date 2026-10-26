@@ -158,6 +158,8 @@ class TestUmdWarmResetResult:
         assert code == 1
         assert not reinit_ran
         assert "UMD warm reset reported failure" in err
+        assert "no chip reads back as failed" in err
+        assert "every chip reads back" not in err
 
     def test_success_reinits(self, tmp_path):
         code, reinit_ran, warm = self._reset(tmp_path, {b: "ok" for b in self.BDFS}, ok=True)
