@@ -75,7 +75,9 @@ def umd_devices() -> dict[int, TTDevice]:
 @pytest.fixture(scope="function")
 def umd_backend() -> TTSMIBackend:
     """Return a TTSMIBackend instance using UMD backend."""
-    cluster_descriptor, devices = TopologyDiscovery.discover(options=get_default_discovery_options())
+    cluster_descriptor, devices = TopologyDiscovery.discover(
+        options=get_default_discovery_options()
+    )
     return TTSMIBackend(devices=devices, umd_cluster_descriptor=cluster_descriptor)
 
 

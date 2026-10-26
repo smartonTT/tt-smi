@@ -385,9 +385,7 @@ def run_galaxy_ipmi_reset(
     On any 0x3 failure, print a warning and fall back to legacy op_mode 0x0
     so the tray reset still goes through.
     """
-    result = _run_ipmitool(
-        _galaxy_ipmi_cmd(ubb_num, dev_num, op_mode, reset_time)
-    )
+    result = _run_ipmitool(_galaxy_ipmi_cmd(ubb_num, dev_num, op_mode, reset_time))
     failure = _ipmi_failure_detail(result)
     if not failure:
         return
@@ -413,9 +411,7 @@ def run_galaxy_ipmi_reset(
         )
 
     fallback = _run_ipmitool(
-        _galaxy_ipmi_cmd(
-            ubb_num, dev_num, GLX_IPMI_OP_MODE_WITH_RETIMER, reset_time
-        )
+        _galaxy_ipmi_cmd(ubb_num, dev_num, GLX_IPMI_OP_MODE_WITH_RETIMER, reset_time)
     )
     fallback_failure = _ipmi_failure_detail(fallback)
     if fallback_failure:
@@ -460,16 +456,17 @@ def parallel_reset_device_ioctl(device_ids: List[int], flag: int) -> List[int]:
 
 
 def timed_wait(seconds):
-    print("\033[93mWaiting for {} seconds: 0\033[0m".format(seconds), end='')
+    print("\033[93mWaiting for {} seconds: 0\033[0m".format(seconds), end="")
     sys.stdout.flush()
 
     for i in range(1, seconds + 1):
         time.sleep(1)
-        print("\r\033[93mWaiting for {} seconds: {}\033[0m".format(seconds, i), end='')
+        print("\r\033[93mWaiting for {} seconds: {}\033[0m".format(seconds, i), end="")
         sys.stdout.flush()
     print()
 
-# Keep this function for now, but it's not used anywhere in the codebase. 
+
+# Keep this function for now, but it's not used anywhere in the codebase.
 # It is the check that is used in Funtest for Galaxy systems and we might need to reference it later.
 def check_wh_galaxy_eth_link_status(devices):
     """
@@ -477,10 +474,24 @@ def check_wh_galaxy_eth_link_status(devices):
     Returns True if the link is up, False otherwise.
     """
     noc_id = 0
-    DEBUG_BUF_ADDR = 0x12c0  # For eth fw 5.0.0 and above
+    DEBUG_BUF_ADDR = 0x12C0  # For eth fw 5.0.0 and above
     eth_locations_noc_0 = [
-        (9, 0), (1, 0), (8, 0), (2, 0), (7, 0), (3, 0), (6, 0), (4, 0),
-        (9, 6), (1, 6), (8, 6), (2, 6), (7, 6), (3, 6), (6, 6), (4, 6),
+        (9, 0),
+        (1, 0),
+        (8, 0),
+        (2, 0),
+        (7, 0),
+        (3, 0),
+        (6, 0),
+        (4, 0),
+        (9, 6),
+        (1, 6),
+        (8, 6),
+        (2, 6),
+        (7, 6),
+        (3, 6),
+        (6, 6),
+        (4, 6),
     ]
     LINK_INACTIVE_FAIL_DUMMY_PACKET = 10
     if len(devices) != 32:
@@ -495,7 +506,9 @@ def check_wh_galaxy_eth_link_status(devices):
     for i, device in enumerate(devices):
         for eth in range(16):
             eth_x, eth_y = eth_locations_noc_0[eth]
-            link_error = device.noc_read32(noc_id, eth_x, eth_y, DEBUG_BUF_ADDR + 0x4 * 96)
+            link_error = device.noc_read32(
+                noc_id, eth_x, eth_y, DEBUG_BUF_ADDR + 0x4 * 96
+            )
             if link_error == LINK_INACTIVE_FAIL_DUMMY_PACKET:
                 link_errors[i] = eth
 
@@ -507,6 +520,7 @@ def check_wh_galaxy_eth_link_status(devices):
                 CMD_LINE_COLOR.ENDC,
             )
         raise Exception("WH Galaxy Ethernet link errors detected!")
+
 
 def umd_ubb_wait_for_driver_load():
     """
@@ -527,13 +541,16 @@ def umd_ubb_wait_for_driver_load():
         except Exception:
             pass
 
-        print(f"Waiting for driver load ... {attempts} seconds (found {device_count} devices)")
+        print(
+            f"Waiting for driver load ... {attempts} seconds (found {device_count} devices)"
+        )
         time.sleep(1)
         attempts += 1
 
     raise Exception(
         f"Driver not loaded with {expected_chip_count} devices after 100 seconds... giving up"
     )
+
 
 def _target_bdfs(reset_input: SmiDeviceInput, chips) -> List[str]:
     """BDFs of the chips a targeted reset names (ids not enumerated are skipped)."""
@@ -814,7 +831,9 @@ def pci_board_reset(
                 TopologyDiscovery.discover(options=options)
             else:
                 os.environ["RUST_BACKTRACE"] = "full"
-                detect_chips_with_callback(print_status=print_status, ignore_ethernet=eth_train_skip)
+                detect_chips_with_callback(
+                    print_status=print_status, ignore_ethernet=eth_train_skip
+                )
         except Exception as e:
             print(
                 CMD_LINE_COLOR.RED,

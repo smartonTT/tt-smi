@@ -862,7 +862,8 @@ class TestPciDriverReset:
         assert len(post_reset_devices) == len(pci_indices)
 
     def test_pci_reset_dev_id(
-        self, reset_test_config_with_backend: Tuple[Tuple[List[int], bool], TTSMIBackend]
+        self,
+        reset_test_config_with_backend: Tuple[Tuple[List[int], bool], TTSMIBackend],
     ):
         """
         Reset the first enumerated device by /dev/tenstorrent/<N> (tt-smi -r /dev/tenstorrent/N).
@@ -885,7 +886,8 @@ class TestPciDriverReset:
         assert len(post_reset_devices) == len(pci_indices)
 
     def test_pci_reset_pci_bdf(
-        self, reset_test_config_with_backend: Tuple[Tuple[List[int], bool], TTSMIBackend]
+        self,
+        reset_test_config_with_backend: Tuple[Tuple[List[int], bool], TTSMIBackend],
     ):
         """
         Reset the first enumerated device by /dev/tenstorrent/<N> (tt-smi -r /dev/tenstorrent/N).
