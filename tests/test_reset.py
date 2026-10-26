@@ -98,7 +98,9 @@ class TestGalaxyIpmiReset:
 
 # Fake BH Galaxy: tray 1 buses 0x01-0x08, tray 2 0x41-0x48, tray 3 0xC1-0xC8, tray 4 0x81-0x88.
 GALAXY_BDFS = [
-    f"0000:{base + n:02x}:00.0" for base in (0x00, 0x40, 0xC0, 0x80) for n in range(1, 9)
+    f"0000:{base + n:02x}:00.0"
+    for base in (0x00, 0x40, 0xC0, 0x80)
+    for n in range(1, 9)
 ]
 
 
@@ -111,8 +113,17 @@ class FakeGalaxy:
     when their tray is re-powered.
     """
 
-    def __init__(self, tmp_path, states=None, heal=None, bdfs=None, subsystem_id=0x47,
-                 absent=(), drop_on_repower=(), reject_per_tray=False):
+    def __init__(
+        self,
+        tmp_path,
+        states=None,
+        heal=None,
+        bdfs=None,
+        subsystem_id=0x47,
+        absent=(),
+        drop_on_repower=(),
+        reject_per_tray=False,
+    ):
         self.root = tmp_path / "devices"
         self.root.mkdir()
         self.rescan_file = tmp_path / "rescan"
@@ -163,12 +174,18 @@ class FakeGalaxy:
     def enumerate_devices_info(self):
         if self.rescan_file.read_text() == "1":
             self._heal(("sysfs",))
-        bdfs = self.enumerated if self.enumerated is not None else [
-            b for b in self.bdfs if self.state[b] not in ("gone",)
-        ]
-        self.enumerated = None  # Only the first enumeration (before the reset) may hide chips.
+        bdfs = (
+            self.enumerated
+            if self.enumerated is not None
+            else [b for b in self.bdfs if self.state[b] not in ("gone",)]
+        )
+        self.enumerated = (
+            None  # Only the first enumeration (before the reset) may hide chips.
+        )
         return {
-            self.bdfs.index(b): MagicMock(pci_bdf=b, subsystem_id=self.subsystem_id, device_id=0xB140)
+            self.bdfs.index(b): MagicMock(
+                pci_bdf=b, subsystem_id=self.subsystem_id, device_id=0xB140
+            )
             for b in bdfs
         }
 
@@ -201,8 +218,15 @@ class FakeGalaxy:
     def ioctl_ids(self, flag):
         return [ids for f, ids in self.ioctls if f == flag]
 
-    def reset(self, ok=True, missing=(), reset_input=None, reinit=True, with_result=True,
-              rescan=True):
+    def reset(
+        self,
+        ok=True,
+        missing=(),
+        reset_input=None,
+        reinit=True,
+        with_result=True,
+        rescan=True,
+    ):
         """Run pci_board_reset(use_umd=True). Returns (exit code or None, reinit ran, WarmReset mock)."""
         reset_input = reset_input or SmiDeviceInput(SmiDeviceTargetKind.ALL, [])
         methods = ["warm_reset", "warm_reset_pci_bdfs", "warm_reset_chip_id"]
@@ -222,17 +246,28 @@ class FakeGalaxy:
             warm.rescan_pci_bdfs.side_effect = self.rescan_pci_bdfs
         clock = MagicMock()
         clock.monotonic.side_effect = itertools.count(0, 10)
-        with patch("tt_smi.reset.SYSFS_PCI_DEVICES", str(self.root)), \
-             patch("tt_smi.reset.SYSFS_PCI_RESCAN", str(self.rescan_file)), \
-             patch("tt_smi.reset.PCIDevice.enumerate_devices_info", side_effect=self.enumerate_devices_info), \
-             patch("tt_smi.reset.WarmReset", warm), \
-             patch("tt_smi.reset.subprocess.run", side_effect=self.run), \
-             patch("tt_smi.reset.parallel_reset_device_ioctl", side_effect=self.ioctl), \
-             patch("tt_smi.reset.timed_wait"), \
-             patch("tt_smi.reset.time", clock), \
-             patch("tt_smi.reset.should_use_secondary_bus_reset", return_value=True), \
-             patch("tt_smi.reset.TopologyDiscovery") as topo, \
-             patch("tt_smi.reset.get_default_discovery_options"):
+        with patch("tt_smi.reset.SYSFS_PCI_DEVICES", str(self.root)), patch(
+            "tt_smi.reset.SYSFS_PCI_RESCAN", str(self.rescan_file)
+        ), patch(
+            "tt_smi.reset.PCIDevice.enumerate_devices_info",
+            side_effect=self.enumerate_devices_info,
+        ), patch(
+            "tt_smi.reset.WarmReset", warm
+        ), patch(
+            "tt_smi.reset.subprocess.run", side_effect=self.run
+        ), patch(
+            "tt_smi.reset.parallel_reset_device_ioctl", side_effect=self.ioctl
+        ), patch(
+            "tt_smi.reset.timed_wait"
+        ), patch(
+            "tt_smi.reset.time", clock
+        ), patch(
+            "tt_smi.reset.should_use_secondary_bus_reset", return_value=True
+        ), patch(
+            "tt_smi.reset.TopologyDiscovery"
+        ) as topo, patch(
+            "tt_smi.reset.get_default_discovery_options"
+        ):
             try:
                 pci_board_reset(reset_input, reinit=reinit, use_umd=True)
                 code = None
@@ -248,7 +283,9 @@ class TestUmdWarmResetResult:
 
     def _reset(self, tmp_path, states, ok, reset_input=None, reinit=True):
         host = FakeGalaxy(tmp_path, states=states)
-        return host.reset(ok=ok, reset_input=reset_input, reinit=reinit, with_result=False)
+        return host.reset(
+            ok=ok, reset_input=reset_input, reinit=reinit, with_result=False
+        )
 
     def test_failed_reset_names_chips_and_exits_nonzero(self, tmp_path, capsys):
         states = {self.BDFS[0]: "ok", self.BDFS[1]: "marker", self.BDFS[2]: "ones"}
@@ -256,11 +293,20 @@ class TestUmdWarmResetResult:
         err = capsys.readouterr().err
         assert code == 1
         assert not reinit_ran
-        assert "Chip 0000:03:00.0 (tray 1) did not come back from reset: reset marker still set" in err
-        assert "Chip 0000:04:00.0 (tray 1) did not come back from reset: config space reads all ones" in err
+        assert (
+            "Chip 0000:03:00.0 (tray 1) did not come back from reset: reset marker still set"
+            in err
+        )
+        assert (
+            "Chip 0000:04:00.0 (tray 1) did not come back from reset: config space reads all ones"
+            in err
+        )
         assert "0000:02:00.0 (tray 1) did not come back" not in err
         # The tray re-power resets 03:00.0 (its marker is not checked after a re-power); 04:00.0 stays dead.
-        assert "Hardware fault: chip 0000:04:00.0 (tray 1) still missing after tray re-power" in err
+        assert (
+            "Hardware fault: chip 0000:04:00.0 (tray 1) still missing after tray re-power"
+            in err
+        )
         assert "1 chip(s) did not come back: 0000:04:00.0" in err
 
     def test_chip_gone_from_pci_is_named(self, tmp_path, capsys):
@@ -268,10 +314,15 @@ class TestUmdWarmResetResult:
         code, _, _ = self._reset(tmp_path, states, ok=False)
         err = capsys.readouterr().err
         assert code == 1
-        assert "Chip 0000:03:00.0 (tray 1) did not come back from reset: gone from PCI" in err
+        assert (
+            "Chip 0000:03:00.0 (tray 1) did not come back from reset: gone from PCI"
+            in err
+        )
 
     def test_failed_reset_with_no_chip_named_still_fails(self, tmp_path, capsys):
-        code, reinit_ran, _ = self._reset(tmp_path, {b: "ok" for b in self.BDFS}, ok=False)
+        code, reinit_ran, _ = self._reset(
+            tmp_path, {b: "ok" for b in self.BDFS}, ok=False
+        )
         err = capsys.readouterr().err
         assert code == 1
         assert not reinit_ran
@@ -280,10 +331,14 @@ class TestUmdWarmResetResult:
         assert "every chip reads back" not in err
 
     def test_success_reinits(self, tmp_path):
-        code, reinit_ran, warm = self._reset(tmp_path, {b: "ok" for b in self.BDFS}, ok=True)
+        code, reinit_ran, warm = self._reset(
+            tmp_path, {b: "ok" for b in self.BDFS}, ok=True
+        )
         assert code is None
         assert reinit_ran
-        warm.warm_reset.assert_called_once_with(list(range(32)), secondary_bus_reset=True)
+        warm.warm_reset.assert_called_once_with(
+            list(range(32)), secondary_bus_reset=True
+        )
 
     def test_success_ignores_marker_restored_by_kmd(self, tmp_path):
         # After POST_RESET the KMD restores saved config, which may carry bit 6.
@@ -309,7 +364,9 @@ class TestUmdWarmResetResult:
     )
     def test_every_target_kind_checks_result(self, tmp_path, kind, value, method):
         states = {self.BDFS[0]: "ok", self.BDFS[1]: "ones", self.BDFS[2]: "ok"}
-        code, _, warm = self._reset(tmp_path, states, ok=False, reset_input=SmiDeviceInput(kind, value))
+        code, _, warm = self._reset(
+            tmp_path, states, ok=False, reset_input=SmiDeviceInput(kind, value)
+        )
         assert code == 1
         getattr(warm, method).assert_called_once_with(value, secondary_bus_reset=True)
 
@@ -339,12 +396,16 @@ class TestFullRecoveryReset:
         host = FakeGalaxy(tmp_path)
         code, reinit_ran, warm = host.reset(ok=True)
         assert code is None and reinit_ran
-        warm.warm_reset_with_result.assert_called_once_with(list(range(32)), secondary_bus_reset=True)
+        warm.warm_reset_with_result.assert_called_once_with(
+            list(range(32)), secondary_bus_reset=True
+        )
         warm.warm_reset.assert_not_called()
         assert host.ipmi == []
 
     def test_tray_repower_brings_back_missing_chip(self, tmp_path, capsys):
-        host = FakeGalaxy(tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"})
+        host = FakeGalaxy(
+            tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"}
+        )
         code, reinit_ran, warm = host.reset(ok=False, missing=[self.LOST])
         out = capsys.readouterr()
         assert code is None and reinit_ran
@@ -370,11 +431,18 @@ class TestFullRecoveryReset:
         assert "UMD warm reset reports it did not come back" in capsys.readouterr().err
 
     def test_per_tray_reset_rejected_resets_all_trays(self, tmp_path):
-        host = FakeGalaxy(tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "all"},
-                          reject_per_tray=True)
+        host = FakeGalaxy(
+            tmp_path,
+            states={self.LOST: "gone"},
+            heal={self.LOST: "all"},
+            reject_per_tray=True,
+        )
         code, _, _ = host.reset(ok=False, missing=[self.LOST])
         assert code is None
-        assert host.ipmi == [("0x2", GLX_IPMI_OP_MODE_NO_RETIMER), ("0xF", GLX_IPMI_OP_MODE_NO_RETIMER)]
+        assert host.ipmi == [
+            ("0x2", GLX_IPMI_OP_MODE_NO_RETIMER),
+            ("0xF", GLX_IPMI_OP_MODE_NO_RETIMER),
+        ]
 
     def test_round_two_repowers_all_trays(self, tmp_path, capsys):
         host = FakeGalaxy(tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "all"})
@@ -400,8 +468,9 @@ class TestFullRecoveryReset:
 
     def test_one_dead_chip_does_not_stop_the_others(self, tmp_path, capsys):
         dead = "0000:c3:00.0"  # tray 3
-        host = FakeGalaxy(tmp_path, states={self.LOST: "gone", dead: "ones"},
-                          heal={self.LOST: "tray"})
+        host = FakeGalaxy(
+            tmp_path, states={self.LOST: "gone", dead: "ones"}, heal={self.LOST: "tray"}
+        )
         code, _, _ = host.reset(ok=False, missing=[self.LOST, dead])
         err = capsys.readouterr().err
         assert code == 1
@@ -413,11 +482,18 @@ class TestFullRecoveryReset:
 
     def test_chip_lost_by_the_tray_repower_is_caught(self, tmp_path, capsys):
         other = "0000:41:00.0"  # also tray 2, healthy before the re-power
-        host = FakeGalaxy(tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"},
-                          drop_on_repower=[other])
+        host = FakeGalaxy(
+            tmp_path,
+            states={self.LOST: "gone"},
+            heal={self.LOST: "tray"},
+            drop_on_repower=[other],
+        )
         code, _, _ = host.reset(ok=False, missing=[self.LOST])
         assert code == 1
-        assert f"Hardware fault: chip {other} (tray 2) still missing" in capsys.readouterr().err
+        assert (
+            f"Hardware fault: chip {other} (tray 2) still missing"
+            in capsys.readouterr().err
+        )
 
     def test_tray_short_before_reset_is_repowered(self, tmp_path, capsys):
         host = FakeGalaxy(tmp_path, absent=[self.LOST], heal={self.LOST: "tray"})
@@ -437,15 +513,21 @@ class TestFullRecoveryReset:
         assert "BDF is not known" in err
 
     def test_old_umd_recounts_and_uses_sysfs_rescan(self, tmp_path):
-        host = FakeGalaxy(tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"})
+        host = FakeGalaxy(
+            tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"}
+        )
         code, _, warm = host.reset(ok=True, with_result=False, rescan=False)
         assert code is None
-        warm.warm_reset.assert_called_once_with(list(range(32)), secondary_bus_reset=True)
+        warm.warm_reset.assert_called_once_with(
+            list(range(32)), secondary_bus_reset=True
+        )
         assert host.ipmi == [("0x2", GLX_IPMI_OP_MODE_NO_RETIMER)]
         assert host.rescan_file.read_text() == "1"
 
     def test_umd_rescan_error_falls_back_to_sysfs(self, tmp_path):
-        host = FakeGalaxy(tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"})
+        host = FakeGalaxy(
+            tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"}
+        )
         host.rescan_pci_bdfs = MagicMock(side_effect=RuntimeError("needs root"))
         code, _, _ = host.reset(ok=False, missing=[self.LOST])
         assert code is None
@@ -551,15 +633,22 @@ class TestFullRecoveryReset:
         target = tmp_path / "rescan"
         target.write_text("")
         target.chmod(0o444)
-        with patch("tt_smi.reset.subprocess.run", return_value=MagicMock(returncode=0)) as run:
+        with patch(
+            "tt_smi.reset.subprocess.run", return_value=MagicMock(returncode=0)
+        ) as run:
             assert _sysfs_write(str(target), "1")
         assert run.call_args[0][0] == ["sudo", "-n", "tee", str(target)]
         assert run.call_args[1]["input"] == "1"
 
     def test_non_galaxy_only_rescans(self, tmp_path, capsys):
         bdfs = ["0000:01:00.0", "0000:02:00.0"]
-        host = FakeGalaxy(tmp_path, bdfs=bdfs, subsystem_id=0x40, states={bdfs[1]: "gone"},
-                          heal={bdfs[1]: "rescan"})
+        host = FakeGalaxy(
+            tmp_path,
+            bdfs=bdfs,
+            subsystem_id=0x40,
+            states={bdfs[1]: "gone"},
+            heal={bdfs[1]: "rescan"},
+        )
         code, reinit_ran, _ = host.reset(ok=False, missing=[bdfs[1]])
         assert code is None and reinit_ran
         assert host.ipmi == []
@@ -567,17 +656,25 @@ class TestFullRecoveryReset:
 
     def test_non_galaxy_chip_that_stays_gone_fails(self, tmp_path, capsys):
         bdfs = ["0000:01:00.0", "0000:02:00.0"]
-        host = FakeGalaxy(tmp_path, bdfs=bdfs, subsystem_id=0x40, states={bdfs[1]: "gone"})
+        host = FakeGalaxy(
+            tmp_path, bdfs=bdfs, subsystem_id=0x40, states={bdfs[1]: "gone"}
+        )
         code, _, _ = host.reset(ok=False, missing=[bdfs[1]])
         assert code == 1
         assert host.ipmi == []
-        assert "Hardware fault: chip 0000:02:00.0 still missing after PCI rescan" in capsys.readouterr().err
+        assert (
+            "Hardware fault: chip 0000:02:00.0 still missing after PCI rescan"
+            in capsys.readouterr().err
+        )
 
     def test_post_reset_failure_is_not_a_recovery(self, tmp_path):
-        host = FakeGalaxy(tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"})
+        host = FakeGalaxy(
+            tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"}
+        )
         bad = GALAXY_BDFS.index(self.LOST)
         host.ioctl = lambda ids, flag: (
-            host.ioctls.append((flag, sorted(ids))) or ([bad] if flag == IoctlResetFlags.POST_RESET else [])
+            host.ioctls.append((flag, sorted(ids)))
+            or ([bad] if flag == IoctlResetFlags.POST_RESET else [])
         )
         code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
         assert code == 1
