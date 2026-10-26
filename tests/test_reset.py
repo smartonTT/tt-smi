@@ -448,7 +448,7 @@ class TestFullRecoveryReset:
         assert host.ioctl_ids(IoctlResetFlags.POST_RESET) == [tray2_ids]
         warm.rescan_pci_bdfs.assert_called_once_with([self.LOST], timeout_s=10.0)
         assert f"Chip {self.LOST} (tray 2) did not come back from reset" in out.err
-        assert "Recount after round 1: 32/32 chips" in out.out
+        assert "Recount after round 1: 32/32 enumerated, 32/32 readable" in out.out
         assert "Recovered" in out.out
         assert "UBB" not in out.out + out.err
 
@@ -480,7 +480,7 @@ class TestFullRecoveryReset:
         assert code is None and reinit_ran
         assert [b for b, _ in host.ipmi] == ["0x2", "0xF"]
         assert host.ioctl_ids(IoctlResetFlags.POST_RESET)[-1] == list(range(32))
-        assert "Recount after round 2: 32/32 chips" in capsys.readouterr().out
+        assert "Recount after round 2: 32/32 enumerated, 32/32 readable" in capsys.readouterr().out
 
     def test_chip_that_never_returns_is_a_hardware_fault(self, tmp_path, capsys):
         host = FakeGalaxy(tmp_path, states={self.LOST: "gone"})
@@ -493,7 +493,7 @@ class TestFullRecoveryReset:
             f"Hardware fault: chip {self.LOST} (tray 2) still missing after tray re-power and PCI rescan: gone from PCI"
             in out.err
         )
-        assert "Recount after round 2: 31/32 chips" in out.out
+        assert "Recount after round 2: 31/32 enumerated, 31/32 readable" in out.out
         assert "UBB" not in out.out + out.err
 
     def test_one_dead_chip_does_not_stop_the_others(self, tmp_path, capsys):
@@ -536,8 +536,38 @@ class TestFullRecoveryReset:
         out = capsys.readouterr().out
         assert code is None and reinit_ran
         assert [m for m, _ in host.ipmi] == ["0x4", "0xF"]
-        assert "Recount after round 2: 32/32 chips" in out
+        assert "Recount after round 2: 32/32 enumerated, 32/32 readable" in out
         assert all(state == "ok" for state in host.state.values())
+
+    def test_round_1_does_not_count_all_ones_chips_as_readable(self, tmp_path, capsys):
+        lost = "0000:c1:00.0"
+        host = FakeGalaxy(
+            tmp_path, states={lost: "gone"}, heal={lost: "tray"}, knock_others=True
+        )
+        host.reset(ok=False, missing=[lost])
+        out = capsys.readouterr().out
+        assert "Recount after round 1: 32/32 enumerated, 8/32 readable" in out
+        assert "Recount after round 1: 32/32 enumerated, 32/32 readable" not in out
+
+    def test_enumerate_error_during_reinit_recovery_exits_1_without_traceback(
+        self, tmp_path, capsys
+    ):
+        host = FakeGalaxy(tmp_path, reinit_error=True)
+        real = host.enumerate_devices_info
+        calls = []
+
+        def enum(*a, **k):
+            calls.append(1)
+            if len(calls) > 1:
+                raise OSError("driver gone")
+            return real(*a, **k)
+
+        host.enumerate_devices_info = enum
+        code, _, _ = host.reset(ok=True)
+        err = capsys.readouterr().err
+        assert code == 1
+        assert "could not enumerate chips: driver gone" in err
+        assert "Traceback" not in err
 
     def test_chip_lost_at_reinit_is_recovered_and_reinit_retried(
         self, tmp_path, capsys
@@ -566,7 +596,7 @@ class TestFullRecoveryReset:
         assert code is None and reinit_ran
         assert host.ipmi == [("0x2", GLX_IPMI_OP_MODE_NO_RETIMER)]
         assert "Tray 2 has 7/8 chips" in out.err
-        assert "Recount after round 1: 32/32 chips" in out.out
+        assert "Recount after round 1: 32/32 enumerated, 32/32 readable" in out.out
 
     def test_tray_short_that_stays_short_is_a_hardware_fault(self, tmp_path, capsys):
         host = FakeGalaxy(tmp_path, absent=[self.LOST])

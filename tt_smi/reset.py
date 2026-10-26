@@ -332,8 +332,13 @@ def recover_missing_chips(
         missing = sorted(set(still))
         short_trays = short
         if is_galaxy:
+            total = len(GALAXY_TRAYS) * GALAXY_CHIPS_PER_TRAY
+            readable = sum(
+                1 for b in bdfs if chip_reset_state(b, check_marker=False) == "ok"
+            )
             print(
-                f"Recount after round {round_num}: {len(bdfs)}/{len(GALAXY_TRAYS) * GALAXY_CHIPS_PER_TRAY} chips"
+                f"Recount after round {round_num}: {len(bdfs)}/{total} enumerated, "
+                f"{readable}/{total} readable"
             )
         if not missing and not short_trays:
             break
@@ -577,7 +582,11 @@ def _recover_after_failed_reinit() -> bool:
     Returns True once all chips read back again (re-init may be retried), False if
     no chip reads as lost (the re-init failure has another cause) or chips stay lost.
     """
-    chips = PCIDevice.enumerate_devices_info()
+    try:
+        chips = PCIDevice.enumerate_devices_info()
+    except Exception as e:
+        print(f"Warning: could not enumerate chips: {e}", file=sys.stderr)
+        return False
     is_galaxy = any(
         info.subsystem_id in GALAXY_SUBSYSTEM_IDS for info in chips.values()
     )
