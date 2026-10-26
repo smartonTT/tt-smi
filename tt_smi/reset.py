@@ -49,6 +49,41 @@ GLX_IPMI_OP_MODE_WITH_RETIMER = "0x0"
 GLX_IPMI_OP_MODE_NO_RETIMER = "0x3"
 
 
+class ResetFailedError(Exception):
+    """Warm reset failed; ``bdfs`` lists the chips that did not come back."""
+
+    def __init__(self, bdfs: List[str]):
+        self.bdfs = bdfs
+        names = ", ".join(bdfs) if bdfs else "no chip named"
+        super().__init__(f"Warm reset failed ({len(bdfs)} chip(s) did not come back: {names})")
+
+
+# Set by the KMD before the reset; a chip that really reset reads it back as 0.
+PCI_COMMAND_RESET_MARKER = 0x40
+SYSFS_PCI_DEVICES = "/sys/bus/pci/devices"
+
+
+def chip_reset_state(bdf: str, check_marker: bool = True) -> str:
+    """Return "ok" if the chip at ``bdf`` came back from reset, else why not.
+
+    After a successful reset the KMD restores the saved PCI config, which may
+    set the marker bit again, so the marker is checked only on a failed reset.
+    """
+    try:
+        with open(os.path.join(SYSFS_PCI_DEVICES, bdf, "config"), "rb") as f:
+            config = f.read(8)
+    except OSError as e:
+        return f"gone from PCI ({e.strerror or e})"
+    if len(config) < 8:
+        return "config space unreadable"
+    if config[0:2] == b"\xff\xff":
+        return "config space reads all ones (chip not responding)"
+    command = int.from_bytes(config[4:6], "little")
+    if check_marker and command & PCI_COMMAND_RESET_MARKER:
+        return "reset marker still set (chip did not reset)"
+    return "ok"
+
+
 def _ipmi_output_is_param_out_of_range(output: str) -> bool:
     text = output.lower()
     return "rsp=0xc9" in text or "parameter out of range" in text
@@ -276,21 +311,41 @@ def umd_pci_warm_reset(
     if reset_input.type == SmiDeviceTargetKind.ALL:
         reset_indices = list(chips.keys())
         print(f"Resetting all PCI devices: {reset_indices}")
-        WarmReset.warm_reset(reset_indices, secondary_bus_reset=secondary_bus_reset)
-        return
-    if reset_input.type == SmiDeviceTargetKind.UMD_LOGICAL_ID:
+        ok = WarmReset.warm_reset(reset_indices, secondary_bus_reset=secondary_bus_reset)
+    elif reset_input.type == SmiDeviceTargetKind.UMD_LOGICAL_ID:
         print(f"Resetting UMD logical IDs: {reset_input.value}")
-        WarmReset.warm_reset_chip_id(reset_indices, secondary_bus_reset=secondary_bus_reset)
-        return
-    if reset_input.type == SmiDeviceTargetKind.PCI_BDF:
+        ok = WarmReset.warm_reset_chip_id(reset_indices, secondary_bus_reset=secondary_bus_reset)
+    elif reset_input.type == SmiDeviceTargetKind.PCI_BDF:
         print(f"Resetting PCI BDFs: {reset_input.value}")
-        WarmReset.warm_reset_pci_bdfs(reset_indices, secondary_bus_reset=secondary_bus_reset)
-        return
-    if reset_input.type == SmiDeviceTargetKind.DEV_TENSTORRENT_ID:
+        ok = WarmReset.warm_reset_pci_bdfs(reset_indices, secondary_bus_reset=secondary_bus_reset)
+    elif reset_input.type == SmiDeviceTargetKind.DEV_TENSTORRENT_ID:
         print(f"Resetting /dev/tenstorrent IDs: {reset_input.value}")
-        WarmReset.warm_reset(reset_indices, secondary_bus_reset=secondary_bus_reset)
+        ok = WarmReset.warm_reset(reset_indices, secondary_bus_reset=secondary_bus_reset)
+    else:
+        raise ValueError(f"Invalid reset type: {reset_input.type}")
+
+    # UMD's arch-agnostic warm reset resets every enumerated chip, so check them all.
+    bdfs = sorted(info.pci_bdf for info in chips.values())
+    states = {bdf: chip_reset_state(bdf, check_marker=not ok) for bdf in bdfs}
+    failed = [bdf for bdf in bdfs if states[bdf] != "ok"]
+    if ok and not failed:
         return
-    raise ValueError(f"Invalid reset type: {reset_input.type}")
+    for bdf in failed:
+        print(
+            CMD_LINE_COLOR.RED,
+            f"Chip {bdf} did not come back from reset: {states[bdf]}",
+            CMD_LINE_COLOR.ENDC,
+            file=sys.stderr,
+        )
+    if not failed:
+        print(
+            CMD_LINE_COLOR.RED,
+            "UMD warm reset reported failure, but every chip reads back as reset.",
+            CMD_LINE_COLOR.ENDC,
+            file=sys.stderr,
+        )
+    raise ResetFailedError(failed)
+
 
 def luwen_pci_reset(
     reset_input: SmiDeviceInput,
@@ -378,7 +433,11 @@ def pci_board_reset(
     """Given a ``SmiDeviceInput`` ``reset_input``, reset the PCI devices using UMD warm reset or luwen (pyluwen)."""
 
     if use_umd:
-        umd_pci_warm_reset(reset_input)
+        try:
+            umd_pci_warm_reset(reset_input)
+        except ResetFailedError as e:
+            print(CMD_LINE_COLOR.RED, e, CMD_LINE_COLOR.ENDC, file=sys.stderr)
+            sys.exit(1)
     else:
         luwen_pci_reset(reset_input)
 

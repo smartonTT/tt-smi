@@ -93,6 +93,112 @@ class TestGalaxyIpmiReset:
         assert exc.value.code == 1
 
 
+class TestUmdWarmResetResult:
+    """``tt-smi -r`` checks UMD warm_reset's result and names chips that did not come back (no hardware)."""
+
+    BDFS = ["0000:02:00.0", "0000:03:00.0", "0000:04:00.0"]
+
+    def _sysfs(self, tmp_path, states):
+        """Fake /sys/bus/pci/devices. state: ok, marker, ones or gone."""
+        for bdf, state in states.items():
+            if state == "gone":
+                continue
+            (tmp_path / bdf).mkdir()
+            command = 0x46 if state == "marker" else 0x06
+            data = b"\x3e\x1e\x00\xb1" + command.to_bytes(2, "little") + b"\x10\x00"
+            if state == "ones":
+                data = b"\xff" * 8
+            (tmp_path / bdf / "config").write_bytes(data)
+        return str(tmp_path)
+
+    def _chips(self, bdfs=None):
+        bdfs = bdfs or self.BDFS
+        return {i: MagicMock(pci_bdf=bdf, subsystem_id=0x47) for i, bdf in enumerate(bdfs)}
+
+    def _reset(self, tmp_path, states, ok, reset_input=None, reinit=True):
+        reset_input = reset_input or SmiDeviceInput(SmiDeviceTargetKind.ALL, [])
+        warm = MagicMock()
+        warm.warm_reset.return_value = ok
+        warm.warm_reset_pci_bdfs.return_value = ok
+        warm.warm_reset_chip_id.return_value = ok
+        with patch("tt_smi.reset.SYSFS_PCI_DEVICES", self._sysfs(tmp_path, states)), \
+             patch("tt_smi.reset.PCIDevice.enumerate_devices_info", return_value=self._chips()), \
+             patch("tt_smi.reset.WarmReset", warm), \
+             patch("tt_smi.reset.should_use_secondary_bus_reset", return_value=True), \
+             patch("tt_smi.reset.TopologyDiscovery") as topo, \
+             patch("tt_smi.reset.get_default_discovery_options"):
+            try:
+                pci_board_reset(reset_input, reinit=reinit, use_umd=True)
+                code = None
+            except SystemExit as e:
+                code = e.code
+        return code, topo.discover.called, warm
+
+    def test_failed_reset_names_chips_and_exits_nonzero(self, tmp_path, capsys):
+        states = {self.BDFS[0]: "ok", self.BDFS[1]: "marker", self.BDFS[2]: "ones"}
+        code, reinit_ran, _ = self._reset(tmp_path, states, ok=False)
+        err = capsys.readouterr().err
+        assert code == 1
+        assert not reinit_ran
+        assert "Chip 0000:03:00.0 did not come back from reset: reset marker still set" in err
+        assert "Chip 0000:04:00.0 did not come back from reset: config space reads all ones" in err
+        assert "0000:02:00.0 did not come back" not in err
+        assert "2 chip(s) did not come back: 0000:03:00.0, 0000:04:00.0" in err
+
+    def test_chip_gone_from_pci_is_named(self, tmp_path, capsys):
+        states = {self.BDFS[0]: "ok", self.BDFS[1]: "gone", self.BDFS[2]: "ok"}
+        code, _, _ = self._reset(tmp_path, states, ok=False)
+        err = capsys.readouterr().err
+        assert code == 1
+        assert "Chip 0000:03:00.0 did not come back from reset: gone from PCI" in err
+
+    def test_failed_reset_with_no_chip_named_still_fails(self, tmp_path, capsys):
+        code, reinit_ran, _ = self._reset(tmp_path, {b: "ok" for b in self.BDFS}, ok=False)
+        err = capsys.readouterr().err
+        assert code == 1
+        assert not reinit_ran
+        assert "UMD warm reset reported failure" in err
+
+    def test_success_reinits(self, tmp_path):
+        code, reinit_ran, warm = self._reset(tmp_path, {b: "ok" for b in self.BDFS}, ok=True)
+        assert code is None
+        assert reinit_ran
+        warm.warm_reset.assert_called_once_with([0, 1, 2], secondary_bus_reset=True)
+
+    def test_success_ignores_marker_restored_by_kmd(self, tmp_path):
+        # After POST_RESET the KMD restores saved config, which may carry bit 6.
+        states = {b: "marker" for b in self.BDFS}
+        code, reinit_ran, _ = self._reset(tmp_path, states, ok=True)
+        assert code is None
+        assert reinit_ran
+
+    def test_success_but_chip_gone_fails(self, tmp_path, capsys):
+        states = {self.BDFS[0]: "ok", self.BDFS[1]: "ok", self.BDFS[2]: "gone"}
+        code, reinit_ran, _ = self._reset(tmp_path, states, ok=True)
+        assert code == 1
+        assert not reinit_ran
+        assert "Chip 0000:04:00.0 did not come back" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "kind,value,method",
+        [
+            (SmiDeviceTargetKind.PCI_BDF, ["0000:03:00.0"], "warm_reset_pci_bdfs"),
+            (SmiDeviceTargetKind.UMD_LOGICAL_ID, [1], "warm_reset_chip_id"),
+            (SmiDeviceTargetKind.DEV_TENSTORRENT_ID, [1], "warm_reset"),
+        ],
+    )
+    def test_every_target_kind_checks_result(self, tmp_path, kind, value, method):
+        states = {self.BDFS[0]: "ok", self.BDFS[1]: "marker", self.BDFS[2]: "ok"}
+        code, _, warm = self._reset(tmp_path, states, ok=False, reset_input=SmiDeviceInput(kind, value))
+        assert code == 1
+        getattr(warm, method).assert_called_once_with(value, secondary_bus_reset=True)
+
+    def test_no_reinit_still_fails(self, tmp_path):
+        states = {self.BDFS[0]: "marker", self.BDFS[1]: "ok", self.BDFS[2]: "ok"}
+        code, _, _ = self._reset(tmp_path, states, ok=False, reinit=False)
+        assert code == 1
+
+
 class TestParseResetInput:
     """Unit tests for device-selection parsing used by ``tt-smi -r`` (no hardware)."""
 
