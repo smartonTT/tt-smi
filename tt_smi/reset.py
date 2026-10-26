@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 from tt_tools_common.ui_common.themes import CMD_LINE_COLOR
 from tt_tools_common.reset_common.wh_reset import WHChipReset
@@ -25,7 +25,11 @@ from tt_smi.utils import (
     IoctlResetFlags,
     reset_device_ioctl,
 )
-from tt_smi.constants import get_default_discovery_options
+from tt_smi.constants import (
+    get_default_discovery_options,
+    BH_UBB_BUS_IDS,
+    WH_UBB_BUS_IDS,
+)
 from tt_smi.device_input import SmiDeviceInput, SmiDeviceTargetKind
 from pyluwen import (
     PciChip,
@@ -61,6 +65,16 @@ class ResetFailedError(Exception):
 # Set by the KMD before the reset; a chip that really reset reads it back as 0.
 PCI_COMMAND_RESET_MARKER = 0x40
 SYSFS_PCI_DEVICES = "/sys/bus/pci/devices"
+SYSFS_PCI_RESCAN = "/sys/bus/pci/rescan"
+
+GALAXY_SUBSYSTEM_IDS = {0x35, 0x47, 0x202}
+GALAXY_TRAYS = (1, 2, 3, 4)
+GALAXY_CHIPS_PER_TRAY = 8
+WORMHOLE_DEVICE_ID = 0x401E
+# Rounds of tray re-power + PCI rescan for chips still missing after the warm reset.
+RECOVERY_MAX_ROUNDS = 2
+TRAY_REPOWER_WAIT_S = 30
+CHIP_RETURN_TIMEOUT_S = 60
 
 
 def chip_reset_state(bdf: str, check_marker: bool = True) -> str:
@@ -82,6 +96,182 @@ def chip_reset_state(bdf: str, check_marker: bool = True) -> str:
     if check_marker and command & PCI_COMMAND_RESET_MARKER:
         return "reset marker still set (chip did not reset)"
     return "ok"
+
+
+def tray_of_bdf(bdf: str, wormhole: bool = False) -> Optional[int]:
+    """Galaxy tray 1-4 of the chip at ``bdf`` (PCI bus & 0xF0), or None."""
+    try:
+        bus = int(bdf.split(":")[-2], 16) & 0xF0
+    except (IndexError, ValueError):
+        return None
+    for tray, bus_id in (WH_UBB_BUS_IDS if wormhole else BH_UBB_BUS_IDS).items():
+        if bus_id == bus:
+            return tray
+    return None
+
+
+def _chip_label(bdf: str, is_galaxy: bool, wormhole: bool) -> str:
+    tray = tray_of_bdf(bdf, wormhole) if is_galaxy else None
+    return f"{bdf} (tray {tray})" if tray else bdf
+
+
+def _present_chips() -> Dict[int, str]:
+    """/dev/tenstorrent id -> BDF of every chip the driver sees now."""
+    try:
+        return {i: info.pci_bdf for i, info in PCIDevice.enumerate_devices_info().items()}
+    except Exception as e:
+        print(f"Warning: could not enumerate chips: {e}", file=sys.stderr)
+        return {}
+
+
+def _short_trays(present_bdfs, wormhole: bool) -> Dict[int, int]:
+    """Galaxy trays with fewer than 8 chips: tray -> chips present."""
+    counts = {tray: 0 for tray in GALAXY_TRAYS}
+    for bdf in present_bdfs:
+        tray = tray_of_bdf(bdf, wormhole)
+        if tray in counts:
+            counts[tray] += 1
+    return {t: n for t, n in counts.items() if n < GALAXY_CHIPS_PER_TRAY}
+
+
+def _sysfs_write(path: str, value: str) -> bool:
+    try:
+        with open(path, "w") as f:
+            f.write(value)
+        return True
+    except PermissionError:
+        pass
+    except OSError as e:
+        print(f"Warning: could not write {path}: {e}", file=sys.stderr)
+        return False
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", "tee", path], input=value, capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        result = None
+    if result is None or result.returncode != 0:
+        detail = "sudo not found" if result is None else (result.stderr.strip() or f"exit code {result.returncode}")
+        print(f"Warning: could not write {path} (needs root): {detail}", file=sys.stderr)
+        return False
+    return True
+
+
+def rescan_pci(bdfs: List[str]) -> None:
+    """Remove the listed chips still on PCI and rescan the bus (UMD's rescan_pci_bdfs, else sysfs)."""
+    rescan = getattr(WarmReset, "rescan_pci_bdfs", None)
+    if rescan is not None:
+        try:
+            rescan(list(bdfs), timeout_s=10.0)
+            return
+        except Exception as e:
+            print(f"Warning: UMD PCI rescan failed ({e}); using the sysfs rescan.", file=sys.stderr)
+    for bdf in bdfs:
+        remove = os.path.join(SYSFS_PCI_DEVICES, bdf, "remove")
+        if os.path.exists(remove):
+            _sysfs_write(remove, "1")
+    _sysfs_write(SYSFS_PCI_RESCAN, "1")
+
+
+def _tray_ipmi_reset(trays: List[int]) -> None:
+    """Re-power only ``trays`` through this host's BMC (in-band ipmitool).
+
+    UBB n on the BMC is tray n+1, so tray t is bit t-1 of the UBB bitmap.
+    If the BMC rejects the per-tray command, reset all four trays (as -glx_reset).
+    """
+    bitmap = 0
+    for tray in trays:
+        bitmap |= 1 << (tray - 1)
+    if bitmap != 0xF:
+        result = _run_ipmitool(
+            _galaxy_ipmi_cmd(hex(bitmap).upper().replace("X", "x"), "0xFF", GLX_IPMI_OP_MODE_NO_RETIMER, "0xF")
+        )
+        failure = _ipmi_failure_detail(result)
+        if not failure:
+            return
+        print(
+            f"{CMD_LINE_COLOR.YELLOW}WARNING!{CMD_LINE_COLOR.ENDC} "
+            f"Per-tray IPMI reset of tray(s) {', '.join(map(str, trays))} failed:\n{failure}\n"
+            f"{CMD_LINE_COLOR.BLUE}Resetting all four trays of this host instead...{CMD_LINE_COLOR.ENDC}"
+        )
+    run_galaxy_ipmi_reset("0xF", "0xFF", GLX_IPMI_OP_MODE_NO_RETIMER, "0xF")
+
+
+def _repower_trays(trays: List[int], wormhole: bool) -> None:
+    """SBR + USER_RESET on the trays' chips, re-power the trays, wait, then rescan."""
+    in_trays = [i for i, bdf in _present_chips().items() if tray_of_bdf(bdf, wormhole) in trays]
+    if in_trays and should_use_secondary_bus_reset(True):
+        for interface_id in parallel_reset_device_ioctl(in_trays, IoctlResetFlags.RESET_PCIE_LINK):
+            print(f"Warning: Secondary bus reset not completed for device /dev/tenstorrent/{interface_id}. Continuing...")
+    for interface_id in parallel_reset_device_ioctl(in_trays, IoctlResetFlags.USER_RESET):
+        print(f"Warning: USER_RESET did not complete for device /dev/tenstorrent/{interface_id}. Continuing...")
+    _tray_ipmi_reset(trays)
+    timed_wait(TRAY_REPOWER_WAIT_S)
+
+
+def recover_missing_chips(
+    missing: List[str],
+    short_trays: Dict[int, int],
+    is_galaxy: bool,
+    wormhole: bool,
+    known: Optional[List[str]] = None,
+) -> Tuple[List[str], Dict[int, int]]:
+    """Bring back chips that did not come back from the warm reset.
+
+    Each round re-powers the trays of the missing chips (Galaxy only; round 1 only those
+    trays, round 2 all four trays of this host), rescans PCI and recounts every chip of
+    ``known`` on the re-powered trays as well as the missing ones. Returns the
+    chips (by BDF) and short trays (tray -> chips present) still missing afterwards.
+    """
+    for round_num in range(1, RECOVERY_MAX_ROUNDS + 1):
+        trays = sorted({tray_of_bdf(b, wormhole) for b in missing} | set(short_trays), key=str)
+        if is_galaxy:
+            # A chip on a bus outside the tray map gets all four trays re-powered.
+            repower = list(GALAXY_TRAYS) if round_num > 1 or None in trays else trays
+            print(
+                CMD_LINE_COLOR.PURPLE,
+                f"Recovery round {round_num}/{RECOVERY_MAX_ROUNDS}: re-powering tray(s) "
+                f"{', '.join(map(str, repower))}, then PCI rescan...",
+                CMD_LINE_COLOR.ENDC,
+            )
+            try:
+                _repower_trays(repower, wormhole)
+            except RuntimeError as e:
+                print(CMD_LINE_COLOR.RED, f"Tray re-power failed: {e}", CMD_LINE_COLOR.ENDC, file=sys.stderr)
+        else:
+            repower = []
+            print(f"Recovery round {round_num}/{RECOVERY_MAX_ROUNDS}: PCI rescan...")
+        rescan_pci(missing)
+
+        deadline = time.monotonic() + CHIP_RETURN_TIMEOUT_S
+        while True:
+            present = _present_chips()
+            bdfs = set(present.values())
+            check = set(missing) | {b for b in known or [] if tray_of_bdf(b, wormhole) in repower}
+            still = [b for b in check if b not in bdfs or chip_reset_state(b, check_marker=False) != "ok"]
+            short = _short_trays(bdfs, wormhole) if is_galaxy and short_trays else {}
+            if (not still and not short) or time.monotonic() >= deadline:
+                break
+            time.sleep(1)
+
+        if repower:
+            post_ids = [i for i, bdf in present.items() if tray_of_bdf(bdf, wormhole) in repower]
+            for interface_id in parallel_reset_device_ioctl(post_ids, IoctlResetFlags.POST_RESET):
+                print(
+                    CMD_LINE_COLOR.RED,
+                    f"Error: POST_RESET failed for device /dev/tenstorrent/{interface_id} "
+                    f"({_chip_label(present[interface_id], is_galaxy, wormhole)}).",
+                    CMD_LINE_COLOR.ENDC,
+                    file=sys.stderr,
+                )
+                still.append(present[interface_id])
+        missing = sorted(set(still))
+        short_trays = short
+        if is_galaxy:
+            print(f"Recount after round {round_num}: {len(bdfs)}/{len(GALAXY_TRAYS) * GALAXY_CHIPS_PER_TRAY} chips")
+        if not missing and not short_trays:
+            break
+    return missing, short_trays
 
 
 def _ipmi_output_is_param_out_of_range(output: str) -> bool:
@@ -293,11 +483,8 @@ def umd_pci_warm_reset(
     """
     chips = PCIDevice.enumerate_devices_info()
     # check if any of the chips are galaxy
-    is_galaxy = False
-    for info in chips.values():
-        if info.subsystem_id in {0x35, 0x47, 0x202}:
-            is_galaxy = True
-            break
+    is_galaxy = any(info.subsystem_id in GALAXY_SUBSYSTEM_IDS for info in chips.values())
+    wormhole = any(info.device_id == WORMHOLE_DEVICE_ID for info in chips.values())
     if is_galaxy:
         print(
             CMD_LINE_COLOR.YELLOW,
@@ -307,44 +494,99 @@ def umd_pci_warm_reset(
         )
     secondary_bus_reset = should_use_secondary_bus_reset(is_galaxy)
 
+    # UMD with warm_reset_with_result names the chips that did not come back.
+    with_result = getattr(WarmReset, "warm_reset_with_result", None)
+    umd_missing: List[str] = []
     reset_indices = reset_input.value
-    if reset_input.type == SmiDeviceTargetKind.ALL:
-        reset_indices = list(chips.keys())
-        print(f"Resetting all PCI devices: {reset_indices}")
-        ok = WarmReset.warm_reset(reset_indices, secondary_bus_reset=secondary_bus_reset)
+    if reset_input.type in (SmiDeviceTargetKind.ALL, SmiDeviceTargetKind.DEV_TENSTORRENT_ID):
+        if reset_input.type == SmiDeviceTargetKind.ALL:
+            reset_indices = list(chips.keys())
+            print(f"Resetting all PCI devices: {reset_indices}")
+        else:
+            print(f"Resetting /dev/tenstorrent IDs: {reset_input.value}")
+        if with_result is not None:
+            result = with_result(reset_indices, secondary_bus_reset=secondary_bus_reset)
+            ok = bool(result.success)
+            umd_missing = list(result.missing_pci_bdfs)
+        else:
+            ok = WarmReset.warm_reset(reset_indices, secondary_bus_reset=secondary_bus_reset)
     elif reset_input.type == SmiDeviceTargetKind.UMD_LOGICAL_ID:
         print(f"Resetting UMD logical IDs: {reset_input.value}")
         ok = WarmReset.warm_reset_chip_id(reset_indices, secondary_bus_reset=secondary_bus_reset)
     elif reset_input.type == SmiDeviceTargetKind.PCI_BDF:
         print(f"Resetting PCI BDFs: {reset_input.value}")
         ok = WarmReset.warm_reset_pci_bdfs(reset_indices, secondary_bus_reset=secondary_bus_reset)
-    elif reset_input.type == SmiDeviceTargetKind.DEV_TENSTORRENT_ID:
-        print(f"Resetting /dev/tenstorrent IDs: {reset_input.value}")
-        ok = WarmReset.warm_reset(reset_indices, secondary_bus_reset=secondary_bus_reset)
     else:
         raise ValueError(f"Invalid reset type: {reset_input.type}")
 
     # UMD's arch-agnostic warm reset resets every enumerated chip, so check them all.
-    bdfs = sorted(info.pci_bdf for info in chips.values())
+    bdfs = sorted({info.pci_bdf for info in chips.values()} | set(umd_missing))
     states = {bdf: chip_reset_state(bdf, check_marker=not ok) for bdf in bdfs}
+    for bdf in umd_missing:
+        if states[bdf] == "ok":
+            states[bdf] = "UMD warm reset reports it did not come back"
     failed = [bdf for bdf in bdfs if states[bdf] != "ok"]
-    if ok and not failed:
+    # A Galaxy has 8 chips on each of its 4 trays; a tray short before the reset is missing chips too.
+    short_trays = (
+        _short_trays(bdfs, wormhole)
+        if is_galaxy and reset_input.type == SmiDeviceTargetKind.ALL
+        else {}
+    )
+    if ok and not failed and not short_trays:
         return
     for bdf in failed:
         print(
             CMD_LINE_COLOR.RED,
-            f"Chip {bdf} did not come back from reset: {states[bdf]}",
+            f"Chip {_chip_label(bdf, is_galaxy, wormhole)} did not come back from reset: {states[bdf]}",
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
         )
-    if not failed:
+    for tray, count in sorted(short_trays.items()):
+        print(
+            CMD_LINE_COLOR.RED,
+            f"Tray {tray} has {count}/{GALAXY_CHIPS_PER_TRAY} chips",
+            CMD_LINE_COLOR.ENDC,
+            file=sys.stderr,
+        )
+    if not failed and not short_trays:
         print(
             CMD_LINE_COLOR.RED,
             "UMD warm reset reported failure; no chip reads back as failed (the reset may not have run).",
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
         )
-    raise ResetFailedError(failed)
+        raise ResetFailedError(failed)
+
+    still, still_short = recover_missing_chips(failed, short_trays, is_galaxy, wormhole, known=bdfs)
+    if not still and not still_short:
+        print(
+            CMD_LINE_COLOR.GREEN,
+            f"Recovered: all {len(failed)} missing chip(s) are back"
+            + (f"; trays {', '.join(map(str, sorted(short_trays)))} full again" if short_trays else "")
+            + ".",
+            CMD_LINE_COLOR.ENDC,
+        )
+        return
+    how = "tray re-power and PCI rescan" if is_galaxy else "PCI rescan"
+    for bdf in still:
+        print(
+            CMD_LINE_COLOR.RED,
+            f"Hardware fault: chip {_chip_label(bdf, is_galaxy, wormhole)} still missing after {how}: "
+            f"{chip_reset_state(bdf, check_marker=False)}",
+            CMD_LINE_COLOR.ENDC,
+            file=sys.stderr,
+        )
+    named = {tray_of_bdf(b, wormhole) for b in still}
+    for tray, count in sorted(still_short.items()):
+        if tray not in named:
+            print(
+                CMD_LINE_COLOR.RED,
+                f"Hardware fault: tray {tray} has {count}/{GALAXY_CHIPS_PER_TRAY} chips after {how} "
+                "(the missing chip was not on PCI before the reset, so its BDF is not known)",
+                CMD_LINE_COLOR.ENDC,
+                file=sys.stderr,
+            )
+    raise ResetFailedError(still + [f"tray {t}" for t in sorted(still_short) if t not in named])
 
 
 def luwen_pci_reset(
