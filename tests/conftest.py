@@ -16,9 +16,21 @@ from tt_tools_common.utils_common.tools_utils import detect_chips_with_callback
 HW_TESTS_ENV = "TT_SMI_HW_TESTS"
 
 
+def hw_tests_enabled() -> bool:
+    """True if TT_SMI_HW_TESTS=1, or if it is unset and we run under GitHub Actions.
+
+    CI runs the hardware job unchanged (its runners reject fork PRs that edit the
+    workflow), while a plain 'pytest tests/' on a dev host stays off the devices.
+    """
+    value = os.environ.get(HW_TESTS_ENV)
+    if value is not None:
+        return value == "1"
+    return os.environ.get("GITHUB_ACTIONS") == "true"
+
+
 def pytest_collection_modifyitems(config, items):
-    """Skip tests that touch real devices or the BMC (resets, ipmitool) unless TT_SMI_HW_TESTS=1."""
-    if os.environ.get(HW_TESTS_ENV) == "1":
+    """Skip tests that touch real devices or the BMC (resets, ipmitool) unless hw_tests_enabled()."""
+    if hw_tests_enabled():
         return
     skip = pytest.mark.skip(reason=f"needs real hardware; set {HW_TESTS_ENV}=1 to run")
     for item in items:
