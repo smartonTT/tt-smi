@@ -110,7 +110,10 @@ class FakeGalaxy:
     ``states``: bdf -> ok, marker, ones or gone (default ok). ``heal``: bdf -> how a chip
     that is not ok comes back: "tray" (its tray re-powered), "all" (all four trays
     re-powered), "rescan" (UMD PCI rescan), "sysfs" (sysfs PCI rescan) or "never" (default). ``drop_on_repower``: chips lost
-    when their tray is re-powered.
+    when their tray is re-powered. ``knock_others``: the first per-tray re-power leaves the
+    chips of every other tray reading all ones until all four trays are re-powered.
+    ``lose_at_reinit``: chips that read all ones at the first re-init (healed by an all-tray
+    re-power); with it, re-init fails while any chip is not ok.
     """
 
     def __init__(
@@ -123,6 +126,9 @@ class FakeGalaxy:
         absent=(),
         drop_on_repower=(),
         reject_per_tray=False,
+        knock_others=False,
+        lose_at_reinit=(),
+        reinit_error=False,
     ):
         self.root = tmp_path / "devices"
         self.root.mkdir()
@@ -133,6 +139,10 @@ class FakeGalaxy:
         self.heal = dict(heal or {})
         self.drop_on_repower = set(drop_on_repower)
         self.reject_per_tray = reject_per_tray
+        self.knock_others = knock_others
+        self.lose_at_reinit = list(lose_at_reinit)
+        self.discovers = 0
+        self.reinit_error = reinit_error
         self.ipmi = []
         self.ioctls = []
         self.state = {b: "ok" for b in self.bdfs}
@@ -199,6 +209,12 @@ class FakeGalaxy:
             for bdf in self.drop_on_repower:
                 if self.tray(bdf) in trays:
                     self._set(bdf, "gone")
+            if self.knock_others and bitmap != 0xF:
+                self.knock_others = False
+                for bdf in self.bdfs:
+                    if self.tray(bdf) not in trays and self.state[bdf] == "ok":
+                        self._set(bdf, "ones")
+                        self.heal[bdf] = "all"
             self._heal(("all",) if bitmap == 0xF else ())
             for bdf, mode in self.heal.items():
                 if mode == "tray" and self.tray(bdf) in trays:
@@ -210,6 +226,18 @@ class FakeGalaxy:
     def rescan_pci_bdfs(self, bdfs, timeout_s=10.0):
         self._heal(("rescan",))
         return [b for b in bdfs if self.state.get(b) != "ok"]
+
+    def discover(self, *args, **kwargs):
+        self.discovers += 1
+        if self.discovers == 1:
+            for bdf in self.lose_at_reinit:
+                self._set(bdf, "ones")
+                self.heal[bdf] = "all"
+        bad = [b for b in self.bdfs if self.state[b] != "ok"]
+        if self.reinit_error:
+            raise RuntimeError("Ethernet training timed out")
+        if bad:
+            raise RuntimeError(f"Read 0xffffffff from PCIE: {bad[0]}")
 
     def ioctl(self, ids, flag):
         self.ioctls.append((flag, sorted(ids)))
@@ -268,6 +296,8 @@ class FakeGalaxy:
         ) as topo, patch(
             "tt_smi.reset.get_default_discovery_options"
         ):
+            if self.lose_at_reinit or self.reinit_error:
+                topo.discover.side_effect = self.discover
             try:
                 pci_board_reset(reset_input, reinit=reinit, use_umd=True)
                 code = None
@@ -494,6 +524,40 @@ class TestFullRecoveryReset:
             f"Hardware fault: chip {other} (tray 2) still missing"
             in capsys.readouterr().err
         )
+
+    def test_repower_that_knocks_other_trays_off_gets_round_2(self, tmp_path, capsys):
+        # OM-E4-GBH02, tray 3 held in reset: its re-power brought tray 3 back but left
+        # trays 1, 2 and 4 reading all ones; round 1 must not count them as present.
+        lost = "0000:c1:00.0"
+        host = FakeGalaxy(
+            tmp_path, states={lost: "gone"}, heal={lost: "tray"}, knock_others=True
+        )
+        code, reinit_ran, _ = host.reset(ok=False, missing=[lost])
+        out = capsys.readouterr().out
+        assert code is None and reinit_ran
+        assert [m for m, _ in host.ipmi] == ["0x4", "0xF"]
+        assert "Recount after round 2: 32/32 chips" in out
+        assert all(state == "ok" for state in host.state.values())
+
+    def test_chip_lost_at_reinit_is_recovered_and_reinit_retried(
+        self, tmp_path, capsys
+    ):
+        lost = "0000:05:00.0"
+        host = FakeGalaxy(tmp_path, lose_at_reinit=[lost])
+        code, _, _ = host.reset(ok=True)
+        out = capsys.readouterr()
+        assert code is None
+        assert host.discovers == 2
+        assert f"Chip {lost} (tray 1) lost after the recount" in out.err
+        assert "re-initializing again" in out.out
+        assert host.ipmi[-1][0] == "0xF"
+
+    def test_reinit_failure_with_no_lost_chip_exits_without_repower(self, tmp_path):
+        host = FakeGalaxy(tmp_path, reinit_error=True)
+        code, _, _ = host.reset(ok=True)
+        assert code == 1
+        assert host.discovers == 1
+        assert host.ipmi == []
 
     def test_tray_short_before_reset_is_repowered(self, tmp_path, capsys):
         host = FakeGalaxy(tmp_path, absent=[self.LOST], heal={self.LOST: "tray"})

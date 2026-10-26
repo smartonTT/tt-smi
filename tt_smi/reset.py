@@ -260,7 +260,8 @@ def recover_missing_chips(
 
     Each round re-powers the trays of the missing chips (Galaxy with ``repower`` only;
     round 1 only those trays, round 2 all four trays of this host), rescans PCI and
-    recounts every chip of ``known`` on the re-powered trays as well as the missing ones.
+    recounts the missing chips and, after a re-power, every chip of ``known`` (a re-power can
+    knock other trays off PCI too), so those feed the next round.
     Returns the chips (by BDF) and short trays (tray -> chips present) still missing afterwards.
     """
     allow_repower = repower
@@ -295,15 +296,20 @@ def recover_missing_chips(
         while True:
             present = _present_chips()
             bdfs = set(present.values())
-            check = set(missing) | {
-                b for b in known or [] if tray_of_bdf(b, wormhole) in repower
-            }
+            # A tray re-power can knock other trays off PCI as well (OM-E4-GBH02, tt-smi -r with
+            # tray 3 held in reset: tray 3 came back, trays 1, 2 and 4 read all ones), so after a
+            # re-power every known chip is rechecked, not only those on the re-powered trays.
+            check = set(missing) | set(known or [] if repower else [])
             still = [
                 b
                 for b in check
                 if b not in bdfs or chip_reset_state(b, check_marker=False) != "ok"
             ]
-            short = _short_trays(bdfs, wormhole) if is_galaxy and short_trays else {}
+            short = (
+                _short_trays(bdfs, wormhole)
+                if is_galaxy and (short_trays or repower)
+                else {}
+            )
             if (not still and not short) or time.monotonic() >= deadline:
                 break
             time.sleep(1)
@@ -565,6 +571,59 @@ def _target_bdfs(reset_input: SmiDeviceInput, chips) -> List[str]:
     return [info.pci_bdf for info in chips.values()]
 
 
+def _recover_after_failed_reinit() -> bool:
+    """Recount every chip after a failed re-init; re-power and rescan the lost ones.
+
+    Returns True once all chips read back again (re-init may be retried), False if
+    no chip reads as lost (the re-init failure has another cause) or chips stay lost.
+    """
+    chips = PCIDevice.enumerate_devices_info()
+    is_galaxy = any(
+        info.subsystem_id in GALAXY_SUBSYSTEM_IDS for info in chips.values()
+    )
+    wormhole = any(info.device_id == WORMHOLE_DEVICE_ID for info in chips.values())
+    bdfs = sorted({info.pci_bdf for info in chips.values()})
+    lost = [b for b in bdfs if chip_reset_state(b, check_marker=False) != "ok"]
+    short_trays = _short_trays(bdfs, wormhole) if is_galaxy else {}
+    if not lost and not short_trays:
+        return False
+    for bdf in lost:
+        print(
+            CMD_LINE_COLOR.RED,
+            f"Chip {_chip_label(bdf, is_galaxy, wormhole)} lost after the recount: "
+            f"{chip_reset_state(bdf, check_marker=False)}",
+            CMD_LINE_COLOR.ENDC,
+            file=sys.stderr,
+        )
+    still, still_short = recover_missing_chips(
+        lost, short_trays, is_galaxy, wormhole, known=bdfs, repower=True
+    )
+    if not still and not still_short:
+        print(
+            CMD_LINE_COLOR.GREEN,
+            f"Recovered: all {len(lost)} lost chip(s) are back; re-initializing again.",
+            CMD_LINE_COLOR.ENDC,
+        )
+        return True
+    for bdf in still:
+        print(
+            CMD_LINE_COLOR.RED,
+            f"Hardware fault: chip {_chip_label(bdf, is_galaxy, wormhole)} still missing after "
+            f"tray re-power and PCI rescan: {chip_reset_state(bdf, check_marker=False)}",
+            CMD_LINE_COLOR.ENDC,
+            file=sys.stderr,
+        )
+    for tray, count in sorted(still_short.items()):
+        print(
+            CMD_LINE_COLOR.RED,
+            f"Hardware fault: tray {tray} has {count}/{GALAXY_CHIPS_PER_TRAY} chips after "
+            "tray re-power and PCI rescan",
+            CMD_LINE_COLOR.ENDC,
+            file=sys.stderr,
+        )
+    return False
+
+
 def umd_pci_warm_reset(
     reset_input: SmiDeviceInput,
 ):
@@ -822,7 +881,8 @@ def pci_board_reset(
             "Re-initializing boards after reset....",
             CMD_LINE_COLOR.ENDC,
         )
-        try:
+
+        def reinit_chips():
             if use_umd:
                 options = get_default_discovery_options()
                 if eth_train_skip:
@@ -834,13 +894,32 @@ def pci_board_reset(
                 detect_chips_with_callback(
                     print_status=print_status, ignore_ethernet=eth_train_skip
                 )
+
+        try:
+            reinit_chips()
         except Exception as e:
             print(
                 CMD_LINE_COLOR.RED,
                 f"Error when re-initializing chips!\n {e}",
                 CMD_LINE_COLOR.ENDC,
             )
-            sys.exit(1)
+            # A chip lost after the recount (it reads all ones at re-init) gets the
+            # recovery rounds once more, then one more re-init, before giving up.
+            if not (
+                use_umd
+                and reset_input.type == SmiDeviceTargetKind.ALL
+                and _recover_after_failed_reinit()
+            ):
+                sys.exit(1)
+            try:
+                reinit_chips()
+            except Exception as e2:
+                print(
+                    CMD_LINE_COLOR.RED,
+                    f"Error when re-initializing chips after recovery!\n {e2}",
+                    CMD_LINE_COLOR.ENDC,
+                )
+                sys.exit(1)
 
 
 def glx_6u_trays_reset(
