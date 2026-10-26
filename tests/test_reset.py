@@ -107,7 +107,7 @@ class FakeGalaxy:
 
     ``states``: bdf -> ok, marker, ones or gone (default ok). ``heal``: bdf -> how a chip
     that is not ok comes back: "tray" (its tray re-powered), "all" (all four trays
-    re-powered), "rescan" (PCI rescan) or "never" (default). ``drop_on_repower``: chips lost
+    re-powered), "rescan" (UMD PCI rescan), "sysfs" (sysfs PCI rescan) or "never" (default). ``drop_on_repower``: chips lost
     when their tray is re-powered.
     """
 
@@ -161,6 +161,8 @@ class FakeGalaxy:
         return {0x00: 1, 0x40: 2, 0xC0: 3, 0x80: 4}[int(bdf.split(":")[1], 16) & 0xF0]
 
     def enumerate_devices_info(self):
+        if self.rescan_file.read_text() == "1":
+            self._heal(("sysfs",))
         bdfs = self.enumerated if self.enumerated is not None else [
             b for b in self.bdfs if self.state[b] not in ("gone",)
         ]
@@ -448,6 +450,102 @@ class TestFullRecoveryReset:
         code, _, _ = host.reset(ok=False, missing=[self.LOST])
         assert code is None
         assert host.rescan_file.read_text() == "1"
+
+    def test_nonroot_umd_rescan_noop_falls_back_to_sysfs(self, tmp_path):
+        # Paired tt-umd returns its input unchanged (no exception) when it may not rescan.
+        host = FakeGalaxy(
+            tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "sysfs"}
+        )
+        host.rescan_pci_bdfs = MagicMock(
+            side_effect=lambda bdfs, timeout_s=10.0: list(bdfs)
+        )
+        code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
+        assert code is None and reinit_ran
+        host.rescan_pci_bdfs.assert_called_once_with([self.LOST], timeout_s=10.0)
+        assert host.rescan_file.read_text() == "1"
+        assert host.ipmi == [("0x2", GLX_IPMI_OP_MODE_NO_RETIMER)]
+
+    def test_unwritable_rescan_skips_umd_rescan(self, tmp_path):
+        host = FakeGalaxy(
+            tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "sysfs"}
+        )
+        with patch("tt_smi.reset.os.access", return_value=False):
+            code, _, warm = host.reset(ok=False, missing=[self.LOST])
+        assert code is None
+        warm.rescan_pci_bdfs.assert_not_called()
+        assert host.rescan_file.read_text() == "1"
+
+    @pytest.mark.parametrize(
+        "kind,value",
+        [
+            (
+                SmiDeviceTargetKind.DEV_TENSTORRENT_ID,
+                [GALAXY_BDFS.index("0000:47:00.0")],
+            ),
+            (SmiDeviceTargetKind.PCI_BDF, ["0000:47:00.0"]),
+            (SmiDeviceTargetKind.UMD_LOGICAL_ID, [GALAXY_BDFS.index("0000:47:00.0")]),
+        ],
+    )
+    def test_targeted_reset_never_repowers_trays(self, tmp_path, capsys, kind, value):
+        host = FakeGalaxy(
+            tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"}
+        )
+        code, _, _ = host.reset(
+            ok=False, missing=[self.LOST], reset_input=SmiDeviceInput(kind, value)
+        )
+        err = capsys.readouterr().err
+        assert code == 1
+        assert host.ipmi == []
+        assert host.rescan_file.read_text() == "1"
+        assert (
+            "Hardware fault: chip 0000:47:00.0 (tray 2) still missing after PCI rescan"
+            in err
+        )
+        assert "full `tt-smi -r` or `tt-smi -glx_reset` can re-power the tray" in err
+
+    @pytest.mark.parametrize(
+        "kind,value",
+        [
+            (
+                SmiDeviceTargetKind.DEV_TENSTORRENT_ID,
+                [GALAXY_BDFS.index("0000:47:00.0")],
+            ),
+            (SmiDeviceTargetKind.PCI_BDF, ["0000:47:00.0"]),
+        ],
+    )
+    def test_targeted_reset_heals_by_rescan(self, tmp_path, kind, value):
+        host = FakeGalaxy(
+            tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "rescan"}
+        )
+        code, reinit_ran, _ = host.reset(
+            ok=False, missing=[self.LOST], reset_input=SmiDeviceInput(kind, value)
+        )
+        assert code is None and reinit_ran
+        assert host.ipmi == []
+
+    @pytest.mark.parametrize(
+        "kind,value",
+        [
+            (SmiDeviceTargetKind.DEV_TENSTORRENT_ID, [0]),
+            (SmiDeviceTargetKind.PCI_BDF, ["0000:01:00.0"]),
+            (SmiDeviceTargetKind.UMD_LOGICAL_ID, [0]),
+        ],
+    )
+    def test_targeted_reset_ignores_untargeted_dead_chip(
+        self, tmp_path, capsys, kind, value
+    ):
+        host = FakeGalaxy(tmp_path, states={"0000:c3:00.0": "ones", self.LOST: "gone"})
+        code, reinit_ran, _ = host.reset(
+            ok=True, missing=[self.LOST], reset_input=SmiDeviceInput(kind, value)
+        )
+        err = capsys.readouterr().err
+        assert code is None and reinit_ran
+        assert host.ipmi == []
+        assert "Hardware fault" not in err
+        assert (
+            "untargeted chip(s) not reading back" in err
+            and "0000:c3:00.0 (tray 3)" in err
+        )
 
     def test_sysfs_rescan_without_root_uses_sudo(self, tmp_path):
         target = tmp_path / "rescan"
