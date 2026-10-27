@@ -21,6 +21,8 @@ from tt_smi.reset import (
     run_galaxy_ipmi_reset,
     GLX_IPMI_OP_MODE_HOLD,
     GLX_IPMI_OP_MODE_NO_RETIMER,
+    GLX_IPMI_OP_MODE_RELEASE,
+    TRAY_HOLD_RELEASE_WAIT_S,
     GLX_IPMI_OP_MODE_WITH_RETIMER,
 )
 from tt_smi.device_input import (
@@ -115,6 +117,10 @@ class FakeGalaxy:
     re-powered), "rescan" (UMD PCI rescan), "sysfs" (sysfs PCI rescan), "post" (POST_RESET
     sent to it), "hold" (its tray held in reset, then re-powered) or "never" (default).
     A hold (op 0x1) makes the tray's chips read all ones until its next re-power.
+    A release (op 0x2) gives held chips back their state from before the hold.
+    ``hold_needs_release``: as on OM-E4-GBH02 (task #3850), a hold not preceded by a
+    release of its tray (since its last hold) leaves the tray's chips on PCI.
+    ``events``: ("ipmi", ubb, op) and ("sleep", seconds) in the order they happened.
     ``drop_on_repower``: chips lost
     when their tray is re-powered. ``knock_others``: the first per-tray re-power leaves the
     chips of every other tray reading all ones until their own tray is re-powered.
@@ -127,6 +133,8 @@ class FakeGalaxy:
     reject_hold = False
     reject_pulse_after_hold = False
     hold_leaves_chips_up = False
+    hold_needs_release = False
+    reject_release = False
 
     def __init__(
         self,
@@ -144,6 +152,8 @@ class FakeGalaxy:
         reinit_error=False,
         post_reset_fail=(),
     ):
+        self.released = set()
+        self.events = []
         self.root = tmp_path / "devices"
         self.root.mkdir()
         self.rescan_file = tmp_path / "rescan"
@@ -233,17 +243,27 @@ class FakeGalaxy:
         if cmd[:3] == ["sudo", "ipmitool", "raw"]:
             bitmap = int(cmd[5], 16)
             self.ipmi.append((cmd[5], cmd[7]))
+            self.events.append(("ipmi", cmd[5], cmd[7]))
+            trays = {t for t in (1, 2, 3, 4) if bitmap & (1 << (t - 1))}
+            if cmd[7] == GLX_IPMI_OP_MODE_RELEASE:
+                if self.reject_release:
+                    return MagicMock(returncode=1, stdout="", stderr=BMC_C9_STDERR)
+                for bdf in [b for b in self.held if self.tray(b) in trays]:
+                    self._set(bdf, self.held.pop(bdf))
+                self.released |= trays
+                return MagicMock(returncode=0, stdout="", stderr="")
             if self.reject_pulse_after_hold and cmd[7] != GLX_IPMI_OP_MODE_HOLD:
                 if any(op == GLX_IPMI_OP_MODE_HOLD for _, op in self.ipmi[:-1]):
                     return MagicMock(returncode=1, stdout="", stderr=BMC_C9_STDERR)
             if self.reject_all or (self.reject_per_tray and bitmap != 0xF):
                 return MagicMock(returncode=1, stdout="", stderr=BMC_C9_STDERR)
-            trays = {t for t in (1, 2, 3, 4) if bitmap & (1 << (t - 1))}
             if cmd[7] == GLX_IPMI_OP_MODE_HOLD:
                 if self.reject_hold:
                     return MagicMock(returncode=1, stdout="", stderr=BMC_C9_STDERR)
+                unreleased = self.hold_needs_release and not trays <= self.released
+                self.released -= trays
                 for bdf in self.bdfs:
-                    if self.hold_leaves_chips_up:
+                    if self.hold_leaves_chips_up or unreleased:
                         break
                     if self.tray(bdf) in trays and self.state[bdf] != "gone":
                         self.held[bdf] = self.state[bdf]
@@ -337,6 +357,7 @@ class FakeGalaxy:
             warm.rescan_pci_bdfs.side_effect = self.rescan_pci_bdfs
         clock = MagicMock()
         clock.monotonic.side_effect = itertools.count(0, 10)
+        clock.sleep.side_effect = lambda s: self.events.append(("sleep", s))
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch("tt_smi.reset.SYSFS_PCI_DEVICES", str(self.root)))
             stack.enter_context(
@@ -749,10 +770,12 @@ class TestFullRecoveryReset:
             states={b: "marker" for b in self.TRAY3},
             heal={b: "hold" for b in self.TRAY3},
         )
+        host.hold_needs_release = True
         code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
         out = capsys.readouterr()
         assert code is None and reinit_ran
         assert host.ipmi == [
+            ("0x4", GLX_IPMI_OP_MODE_RELEASE),
             ("0x4", GLX_IPMI_OP_MODE_HOLD),
             ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
         ]
@@ -828,8 +851,10 @@ class TestFullRecoveryReset:
         assert code == 1
         assert not reinit_ran
         assert host.ipmi == [
+            ("0x4", GLX_IPMI_OP_MODE_RELEASE),
             ("0x4", GLX_IPMI_OP_MODE_HOLD),
             ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
+            ("0x4", GLX_IPMI_OP_MODE_RELEASE),
             ("0x4", GLX_IPMI_OP_MODE_HOLD),
             ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
         ]
@@ -845,8 +870,74 @@ class TestFullRecoveryReset:
         err = capsys.readouterr().err
         assert code == 1
         assert not reinit_ran
-        assert host.ipmi == [("0x4", GLX_IPMI_OP_MODE_HOLD)]
+        assert host.ipmi == [
+            ("0x4", GLX_IPMI_OP_MODE_RELEASE),
+            ("0x4", GLX_IPMI_OP_MODE_HOLD),
+        ]
         assert "hold of tray(s) 3 failed" in err
+
+    def test_hold_sends_release_waits_then_holds(self, tmp_path, capsys):
+        # Mock only. Task #3850: a 0x1 hold sent straight after the 0x3 pulse left a live
+        # tray 3 on PCI (0/3); 0x2, ~10 s, then 0x1 dropped it every time. The release, the
+        # wait and the hold come back to back, before the pulse.
+        host = FakeGalaxy(
+            tmp_path,
+            states={b: "marker" for b in self.TRAY3},
+            heal={b: "hold" for b in self.TRAY3},
+        )
+        host.hold_needs_release = True
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        capsys.readouterr()
+        assert code is None and reinit_ran
+        i = host.events.index(("ipmi", "0x4", GLX_IPMI_OP_MODE_RELEASE))
+        assert host.events[i : i + 3] == [
+            ("ipmi", "0x4", GLX_IPMI_OP_MODE_RELEASE),
+            ("sleep", TRAY_HOLD_RELEASE_WAIT_S),
+            ("ipmi", "0x4", GLX_IPMI_OP_MODE_HOLD),
+        ]
+        assert TRAY_HOLD_RELEASE_WAIT_S == 10
+        pulse = host.events.index(("ipmi", "0x4", GLX_IPMI_OP_MODE_NO_RETIMER))
+        assert pulse > i + 2
+
+    def test_hold_with_no_release_first_leaves_the_live_tray_on_pci(
+        self, tmp_path, capsys
+    ):
+        # The mock models #3850: with the release rejected, the hold leaves tray 3 on PCI.
+        # The hold warns, the pulse still runs, and each chip still unreset is a
+        # hardware fault (exit 1, no re-init).
+        host = FakeGalaxy(
+            tmp_path,
+            states={b: "marker" for b in self.TRAY3},
+            heal={b: "hold" for b in self.TRAY3},
+        )
+        host.hold_needs_release = True
+        host.reject_release = True
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
+        assert code == 1 and not reinit_ran
+        assert "release of tray(s) 3 before the hold failed" in out.out
+        assert "8 chip(s) still read on PCI 30 s into the hold of tray(s) 3" in out.out
+        for b in self.TRAY3:
+            assert f"Hardware fault: chip {b} (tray 3) still missing" in out.err
+
+    def test_rejected_release_still_holds(self, tmp_path, capsys):
+        # A BMC that rejects 0x2 but takes 0x1 (and drops the tray on it): warn, hold anyway.
+        host = FakeGalaxy(
+            tmp_path,
+            states={b: "marker" for b in self.TRAY3},
+            heal={b: "hold" for b in self.TRAY3},
+        )
+        host.reject_release = True
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
+        assert code is None and reinit_ran
+        assert "release of tray(s) 3 before the hold failed" in out.out
+        assert host.ipmi == [
+            ("0x4", GLX_IPMI_OP_MODE_RELEASE),
+            ("0x4", GLX_IPMI_OP_MODE_HOLD),
+            ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
+        ]
+        assert all(state == "ok" for state in host.state.values())
 
     def test_tray_that_stays_down_is_the_only_tray_repowered(self, tmp_path, capsys):
         # A whole tray that never comes back: both rounds re-power tray 3 alone (trays 1, 2

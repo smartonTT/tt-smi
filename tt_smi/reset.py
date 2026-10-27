@@ -53,6 +53,10 @@ GLX_IPMI_OP_MODE_WITH_RETIMER = "0x0"
 GLX_IPMI_OP_MODE_NO_RETIMER = "0x3"
 # Holds the UBB in reset until the next reset command releases it.
 GLX_IPMI_OP_MODE_HOLD = "0x1"
+# Releases the UBB from reset. Sent before a hold: on a live tray a hold sent straight after
+# a 0x3 pulse left its chips on PCI (task #3850, 0/3); 0x2, ~10 s, then 0x1 dropped them every time.
+GLX_IPMI_OP_MODE_RELEASE = "0x2"
+TRAY_HOLD_RELEASE_WAIT_S = 10
 
 
 class ResetFailedError(Exception):
@@ -252,17 +256,25 @@ def _tray_ipmi_reset(trays: List[int]) -> None:
 def _tray_ipmi_hold(trays: List[int], bdfs: List[str]) -> None:
     """Hold ``trays`` in reset through this host's BMC until ``bdfs`` drop off PCI.
 
+    Sends the release (op 0x2), waits TRAY_HOLD_RELEASE_WAIT_S, then the hold (op 0x1).
     The caller's re-power pulse then releases them. Raises RuntimeError if the BMC
     rejects the hold; a hold that leaves chips on PCI only warns (the pulse still runs).
     """
     bitmap = 0
     for tray in trays:
         bitmap |= 1 << (tray - 1)
-    result = _run_ipmitool(
-        _galaxy_ipmi_cmd(
-            hex(bitmap).upper().replace("X", "x"), "0xFF", GLX_IPMI_OP_MODE_HOLD, "0xF"
-        )
+    ubb = hex(bitmap).upper().replace("X", "x")
+    # Release first, wait, then hold (see GLX_IPMI_OP_MODE_RELEASE).
+    failure = _ipmi_failure_detail(
+        _run_ipmitool(_galaxy_ipmi_cmd(ubb, "0xFF", GLX_IPMI_OP_MODE_RELEASE, "0xF"))
     )
+    if failure:
+        print(
+            f"{CMD_LINE_COLOR.YELLOW}WARNING!{CMD_LINE_COLOR.ENDC} "
+            f"release of tray(s) {', '.join(map(str, trays))} before the hold failed:\n{failure}"
+        )
+    time.sleep(TRAY_HOLD_RELEASE_WAIT_S)
+    result = _run_ipmitool(_galaxy_ipmi_cmd(ubb, "0xFF", GLX_IPMI_OP_MODE_HOLD, "0xF"))
     failure = _ipmi_failure_detail(result)
     if failure:
         raise RuntimeError(
