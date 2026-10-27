@@ -323,7 +323,29 @@ def _repower_trays(
             list(hold),
             [b for b in present.values() if tray_of_bdf(b, wormhole) in hold],
         )
-    _tray_ipmi_reset(trays)
+    try:
+        _tray_ipmi_reset(trays)
+    except RuntimeError as e:
+        if hold:
+            bitmap = 0
+            for tray in hold:
+                bitmap |= 1 << (tray - 1)
+            release = " ".join(
+                _galaxy_ipmi_cmd(
+                    hex(bitmap).upper().replace("X", "x"),
+                    "0xFF",
+                    GLX_IPMI_OP_MODE_NO_RETIMER,
+                    "0xF",
+                )
+            )
+            print(
+                CMD_LINE_COLOR.RED,
+                f"Tray(s) {', '.join(map(str, hold))} are still held in reset: the release "
+                f"pulse failed ({e}). Release them in-band with: {release}",
+                CMD_LINE_COLOR.ENDC,
+                file=sys.stderr,
+            )
+        raise
     timed_wait(TRAY_REPOWER_WAIT_S)
 
 
@@ -383,7 +405,14 @@ def recover_missing_chips(
     """
     allow_repower = repower
     stopped = None
-    hold: set = set()
+    # A chip whose reset marker is set after the warm reset was not reset, and the plain
+    # 0x3 pulse does not reset a live tray (task #3791, 2/2): round 1 holds its tray.
+    hold: set = {
+        tray_of_bdf(b, wormhole)
+        for b in missing
+        if chip_reset_state(b).startswith("reset marker")
+    }
+    hold.discard(None)
     for round_num in range(1, RECOVERY_MAX_ROUNDS + 1):
         trays = sorted(
             {tray_of_bdf(b, wormhole) for b in missing} | set(short_trays), key=str
@@ -473,7 +502,10 @@ def recover_missing_chips(
                 if back and chip_reset_state(bdf).startswith("reset marker"):
                     still = sorted(set(still) | {bdf})
                     hold.add(tray_of_bdf(bdf, wormhole))
-                    note = " The chip did not reset (reset marker still set); it stays missing."
+                    note = (
+                        " POST_RESET failed and the reset marker reads set "
+                        "(chip may not have reset); it stays missing."
+                    )
                 elif back:
                     note = " The chip reads back on PCI; the re-init checks it."
                 else:

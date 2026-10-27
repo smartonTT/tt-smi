@@ -124,6 +124,7 @@ class FakeGalaxy:
 
     lose_at_reinit_heal = "tray"
     reject_hold = False
+    reject_pulse_after_hold = False
 
     def __init__(
         self,
@@ -230,6 +231,9 @@ class FakeGalaxy:
         if cmd[:3] == ["sudo", "ipmitool", "raw"]:
             bitmap = int(cmd[5], 16)
             self.ipmi.append((cmd[5], cmd[7]))
+            if self.reject_pulse_after_hold and cmd[7] != GLX_IPMI_OP_MODE_HOLD:
+                if any(op == GLX_IPMI_OP_MODE_HOLD for _, op in self.ipmi[:-1]):
+                    return MagicMock(returncode=1, stdout="", stderr=BMC_C9_STDERR)
             if self.reject_all or (self.reject_per_tray and bitmap != 0xF):
                 return MagicMock(returncode=1, stdout="", stderr=BMC_C9_STDERR)
             trays = {t for t in (1, 2, 3, 4) if bitmap & (1 << (t - 1))}
@@ -722,13 +726,9 @@ class TestFullRecoveryReset:
         assert "Recovered: all 8 missing chip(s) are back" in out.out
         assert all(state == "ok" for state in host.state.values())
 
-    def test_live_tray_the_pulse_did_not_reset_is_held_then_repowered(
-        self, tmp_path, capsys
-    ):
-        # OM-E4-GBH02 healthy box (09:43 PDT 10-27): the warm reset left c1-c8:00.0 with the
-        # reset marker set and the round 1 tray 3 pulse did not reset them. POST_RESET failed,
-        # the recount said 32/32 and re-init timed out on their firmware (exit 1). Round 2
-        # now holds tray 3 in reset until its chips drop, then re-powers it.
+    def test_marker_set_chips_seed_the_hold_in_round_1(self, tmp_path, capsys):
+        # Mock only. Task #3791 showed the plain 0x3 pulse does not reset a live tray (2/2):
+        # chips whose marker reads set after the warm reset get their tray held in round 1.
         host = FakeGalaxy(
             tmp_path,
             states={b: "marker" for b in self.TRAY3},
@@ -738,18 +738,54 @@ class TestFullRecoveryReset:
         out = capsys.readouterr()
         assert code is None and reinit_ran
         assert host.ipmi == [
-            ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
             ("0x4", GLX_IPMI_OP_MODE_HOLD),
             ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
         ]
-        assert (
-            "(0000:c1:00.0 (tray 3)). The chip did not reset (reset marker still set)"
-            in out.err
-        )
-        assert "Recount after round 1: 24/32 chips" in out.out
-        assert "Recount after round 2: 32/32 chips" in out.out
-        assert "Hardware fault" not in out.err
+        assert "Recount after round 1: 32/32 chips" in out.out
+        assert "Recount after round 2" not in out.out
         assert all(state == "ok" for state in host.state.values())
+
+    def test_post_reset_failure_with_marker_set_is_labelled(self, tmp_path, capsys):
+        # A marker-set chip that comes back unreset after a pulse with no hold (marker not
+        # set at entry, set after the re-power): the message says the chip may not have reset.
+        host = FakeGalaxy(tmp_path, states={b: "ones" for b in self.TRAY3})
+        orig = host.run
+
+        def run(cmd, **kw):
+            res = orig(cmd, **kw)
+            if cmd[:3] == ["sudo", "ipmitool", "raw"] and cmd[7] != GLX_IPMI_OP_MODE_HOLD:
+                for b in self.TRAY3:
+                    host._set(b, "marker")
+            return res
+
+        host.run = run
+        host.reset(ok=False, missing=self.TRAY3)
+        err = capsys.readouterr().err
+        assert (
+            "POST_RESET failed and the reset marker reads set "
+            "(chip may not have reset)" in err
+        )
+
+    def test_hold_accepted_pulse_rejected_bmc_gone_names_the_held_tray(
+        self, tmp_path, capsys
+    ):
+        host = FakeGalaxy(tmp_path, states={b: "marker" for b in self.TRAY3})
+        host.reject_pulse_after_hold = True
+        host.mc_info = ["ok", "fail"]
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        err = capsys.readouterr().err
+        assert code == 1
+        assert not reinit_ran
+        assert "Tray(s) 3 are still held in reset" in err
+        assert "raw 0x30 0x8B 0x4 0xFF 0x3 0xF" in err
+
+    def test_hold_accepted_fallback_fails_names_the_held_tray(self, tmp_path, capsys):
+        host = FakeGalaxy(tmp_path, states={b: "marker" for b in self.TRAY3})
+        host.reject_pulse_after_hold = True
+        code, _, _ = host.reset(ok=False, missing=self.TRAY3)
+        err = capsys.readouterr().err
+        assert code == 1
+        assert "Tray(s) 3 are still held in reset" in err
 
     def test_live_tray_the_hold_does_not_reset_is_a_hardware_fault(
         self, tmp_path, capsys
@@ -760,6 +796,7 @@ class TestFullRecoveryReset:
         assert code == 1
         assert not reinit_ran
         assert host.ipmi == [
+            ("0x4", GLX_IPMI_OP_MODE_HOLD),
             ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
             ("0x4", GLX_IPMI_OP_MODE_HOLD),
             ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
@@ -776,10 +813,7 @@ class TestFullRecoveryReset:
         err = capsys.readouterr().err
         assert code == 1
         assert not reinit_ran
-        assert host.ipmi == [
-            ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
-            ("0x4", GLX_IPMI_OP_MODE_HOLD),
-        ]
+        assert host.ipmi == [("0x4", GLX_IPMI_OP_MODE_HOLD)]
         assert "hold of tray(s) 3 failed" in err
 
     def test_tray_that_stays_down_is_the_only_tray_repowered(self, tmp_path, capsys):
