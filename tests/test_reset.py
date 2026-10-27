@@ -489,9 +489,12 @@ class TestFullRecoveryReset:
     def assert_stopped_after_round_1(self, host, code, reinit_ran, out):
         tray2_ids = sorted(GALAXY_BDFS.index(b) for b in self.TRAY2 if b != self.LOST)
         assert code == 1 and not reinit_ran
-        # Round 1's SBR + USER_RESET went to tray 2 only; nothing ran after that.
+        # Round 1's SBR + USER_RESET went to tray 2 only; no reset or re-power after that,
+        # but those chips still got POST_RESET and every chip was recounted.
         assert host.ioctl_ids(IoctlResetFlags.RESET_PCIE_LINK) == [tray2_ids]
         assert host.ioctl_ids(IoctlResetFlags.USER_RESET) == [tray2_ids]
+        assert host.ioctl_ids(IoctlResetFlags.POST_RESET) == [tray2_ids]
+        assert "Recount after round 1: 31/32 chips" in out.out
         assert "Recovery round 2" not in out.out
         assert "UBB" not in out.out + out.err
 
@@ -554,6 +557,64 @@ class TestFullRecoveryReset:
             f"Hardware fault: chip {self.LOST} (tray 2) still missing "
             "(re-power of tray(s) 2 failed (IPMI command failed:" in out.err
         )
+
+    class Round2Rejected(FakeGalaxy):
+        """Round 1's per-tray re-power works but leaves the chip gone; round 2's 0xF is
+        rejected, and its USER_RESET leaves ``knocked`` reading all ones."""
+
+        knocked = ()
+
+        def run(self, cmd, **kwargs):
+            if cmd[:3] == ["sudo", "ipmitool", "raw"] and int(cmd[5], 16) == 0xF:
+                self.reject_all = True
+            return super().run(cmd, **kwargs)
+
+        def ioctl(self, ids, flag):
+            if flag == IoctlResetFlags.USER_RESET and self.ioctl_ids(flag):
+                for bdf in self.knocked:
+                    self._set(bdf, "ones")
+            return super().ioctl(ids, flag)
+
+    def test_failed_round_2_repower_still_post_resets_and_names_every_chip(
+        self, tmp_path, capsys
+    ):
+        knocked = ["0000:02:00.0", "0000:c1:00.0"]  # trays 1 and 3
+        host = self.Round2Rejected(
+            tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "all"}
+        )
+        host.knocked = knocked
+        code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
+        out = capsys.readouterr()
+        present = sorted(GALAXY_BDFS.index(b) for b in GALAXY_BDFS if b != self.LOST)
+        assert code == 1 and not reinit_ran
+        assert [b for b, _ in host.ipmi] == ["0x2", "0xF", "0xF"]  # 0xF + legacy retry
+        # Round 2's SBR + USER_RESET reached all 31 present chips, and so does POST_RESET.
+        assert host.ioctl_ids(IoctlResetFlags.USER_RESET)[-1] == present
+        assert host.ioctl_ids(IoctlResetFlags.POST_RESET)[-1] == present
+        assert len(host.ioctl_ids(IoctlResetFlags.USER_RESET)) == 2  # nothing after
+        assert "Recount after round 2: 31/32 chips" in out.out
+        how = "(re-power of tray(s) 1, 2, 3, 4 failed (IPMI command failed:"
+        for bdf, tray in [(self.LOST, 2), (knocked[0], 1), (knocked[1], 3)]:
+            assert f"Hardware fault: chip {bdf} (tray {tray}) still missing {how}" in (
+                out.err
+            )
+        assert out.err.count("Hardware fault: chip") == 3
+        assert "UBB" not in out.out + out.err
+
+    def test_failed_repower_with_chip_back_by_rescan_recovers(self, tmp_path):
+        # Every re-power is rejected, but the PCI rescan brings the chip back: it reads ok
+        # and got POST_RESET, so the box is whole and the reset succeeds.
+        host = FakeGalaxy(
+            tmp_path,
+            states={self.LOST: "gone"},
+            heal={self.LOST: "rescan"},
+            reject_all=True,
+        )
+        code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
+        assert code is None and reinit_ran
+        assert host.ioctl_ids(IoctlResetFlags.POST_RESET) == [
+            sorted(GALAXY_BDFS.index(b) for b in self.TRAY2 if b != self.LOST)
+        ]
 
     def test_reinit_path_bmc_gone_after_round_1_stops(self, tmp_path, capsys):
         lost = "0000:45:00.0"  # tray 2; read all ones at re-init, heals only on 0xF

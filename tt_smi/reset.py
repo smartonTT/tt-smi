@@ -250,11 +250,16 @@ def _ipmi_answers() -> bool:
     return result.returncode == 0
 
 
-def _repower_trays(trays: List[int], wormhole: bool) -> None:
-    """SBR + USER_RESET on the trays' chips, re-power the trays, wait, then rescan."""
-    in_trays = [
-        i for i, bdf in _present_chips().items() if tray_of_bdf(bdf, wormhole) in trays
-    ]
+def _repower_trays(
+    trays: List[int], wormhole: bool, user_reset: Optional[List[str]] = None
+) -> None:
+    """SBR + USER_RESET on the trays' chips, re-power the trays, then wait.
+
+    The BDFs sent USER_RESET are added to ``user_reset`` before the re-power, so a caller
+    whose re-power raises still knows which chips need POST_RESET.
+    """
+    present = _present_chips()
+    in_trays = [i for i, bdf in present.items() if tray_of_bdf(bdf, wormhole) in trays]
     if in_trays and should_use_secondary_bus_reset(True):
         for interface_id in parallel_reset_device_ioctl(
             in_trays, IoctlResetFlags.RESET_PCIE_LINK
@@ -268,6 +273,8 @@ def _repower_trays(trays: List[int], wormhole: bool) -> None:
         print(
             f"Warning: USER_RESET did not complete for device /dev/tenstorrent/{interface_id}. Continuing..."
         )
+    if user_reset is not None:
+        user_reset.extend(present[i] for i in in_trays)
     _tray_ipmi_reset(trays)
     timed_wait(TRAY_REPOWER_WAIT_S)
 
@@ -279,7 +286,7 @@ def recover_missing_chips(
     wormhole: bool,
     known: Optional[List[str]] = None,
     repower: bool = True,
-) -> Tuple[List[str], Dict[int, int]]:
+) -> Tuple[List[str], Dict[int, int], Optional[str]]:
     """Bring back chips that did not come back from the warm reset.
 
     Each round re-powers the trays of the missing chips (Galaxy with ``repower`` only;
@@ -288,11 +295,13 @@ def recover_missing_chips(
     knock other trays off PCI too), so those feed the next round.
     Before each re-power (and before the all-tray fallback) the BMC must answer
     ``ipmitool mc info``; if it does not, or a re-power fails, recovery stops there: no
-    further SBR, USER_RESET or re-power.
+    further SBR, USER_RESET or re-power. A stop after a round's SBR + USER_RESET still
+    rescans PCI, sends POST_RESET to the chips that got USER_RESET and recounts every chip.
     Returns the chips (by BDF) and short trays (tray -> chips present) still missing afterwards,
     and why recovery stopped early (None if it did not).
     """
     allow_repower = repower
+    stopped = None
     for round_num in range(1, RECOVERY_MAX_ROUNDS + 1):
         trays = sorted(
             {tray_of_bdf(b, wormhole) for b in missing} | set(short_trays), key=str
@@ -317,8 +326,9 @@ def recover_missing_chips(
                 f"{', '.join(map(str, repower))}, then PCI rescan...",
                 CMD_LINE_COLOR.ENDC,
             )
+            user_reset: List[str] = []
             try:
-                _repower_trays(repower, wormhole)
+                _repower_trays(repower, wormhole, user_reset)
             except RuntimeError as e:
                 # Stop: escalating after a failed re-power can take down healthy trays too.
                 stopped = (
@@ -329,11 +339,11 @@ def recover_missing_chips(
                 )
                 print(
                     CMD_LINE_COLOR.RED,
-                    f"Tray re-power failed: {e}. Recovery stops: no further SBR, USER_RESET or re-power.",
+                    f"Tray re-power failed: {e}. Recovery stops: no further SBR, USER_RESET or "
+                    "re-power; PCI rescan, POST_RESET and recount only.",
                     CMD_LINE_COLOR.ENDC,
                     file=sys.stderr,
                 )
-                return sorted(missing), short_trays, stopped
         else:
             repower = []
             print(f"Recovery round {round_num}/{RECOVERY_MAX_ROUNDS}: PCI rescan...")
@@ -362,8 +372,16 @@ def recover_missing_chips(
             time.sleep(1)
 
         if repower:
+            # After a stop the trays may not have been re-powered: POST_RESET goes to the
+            # chips that got USER_RESET, not to every chip on those trays.
             post_ids = [
-                i for i, bdf in present.items() if tray_of_bdf(bdf, wormhole) in repower
+                i
+                for i, bdf in present.items()
+                if (
+                    bdf in user_reset
+                    if stopped
+                    else tray_of_bdf(bdf, wormhole) in repower
+                )
             ]
             for interface_id in parallel_reset_device_ioctl(
                 post_ids, IoctlResetFlags.POST_RESET
@@ -382,9 +400,9 @@ def recover_missing_chips(
             print(
                 f"Recount after round {round_num}: {len(bdfs)}/{len(GALAXY_TRAYS) * GALAXY_CHIPS_PER_TRAY} chips"
             )
-        if not missing and not short_trays:
+        if stopped or (not missing and not short_trays):
             break
-    return missing, short_trays, None
+    return missing, short_trays, stopped if (missing or short_trays) else None
 
 
 def _ipmi_output_is_param_out_of_range(output: str) -> bool:
