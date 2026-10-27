@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import itertools
 import subprocess
 import pytest
@@ -333,22 +334,33 @@ class FakeGalaxy:
             warm.rescan_pci_bdfs.side_effect = self.rescan_pci_bdfs
         clock = MagicMock()
         clock.monotonic.side_effect = itertools.count(0, 10)
-        with (
-            patch("tt_smi.reset.SYSFS_PCI_DEVICES", str(self.root)),
-            patch("tt_smi.reset.SYSFS_PCI_RESCAN", str(self.rescan_file)),
-            patch(
-                "tt_smi.reset.PCIDevice.enumerate_devices_info",
-                side_effect=self.enumerate_devices_info,
-            ),
-            patch("tt_smi.reset.WarmReset", warm),
-            patch("tt_smi.reset.subprocess.run", side_effect=self.run),
-            patch("tt_smi.reset.parallel_reset_device_ioctl", side_effect=self.ioctl),
-            patch("tt_smi.reset.timed_wait"),
-            patch("tt_smi.reset.time", clock),
-            patch("tt_smi.reset.should_use_secondary_bus_reset", return_value=True),
-            patch("tt_smi.reset.TopologyDiscovery") as topo,
-            patch("tt_smi.reset.get_default_discovery_options"),
-        ):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("tt_smi.reset.SYSFS_PCI_DEVICES", str(self.root)))
+            stack.enter_context(
+                patch("tt_smi.reset.SYSFS_PCI_RESCAN", str(self.rescan_file))
+            )
+            stack.enter_context(
+                patch(
+                    "tt_smi.reset.PCIDevice.enumerate_devices_info",
+                    side_effect=self.enumerate_devices_info,
+                )
+            )
+            stack.enter_context(patch("tt_smi.reset.WarmReset", warm))
+            stack.enter_context(
+                patch("tt_smi.reset.subprocess.run", side_effect=self.run)
+            )
+            stack.enter_context(
+                patch(
+                    "tt_smi.reset.parallel_reset_device_ioctl", side_effect=self.ioctl
+                )
+            )
+            stack.enter_context(patch("tt_smi.reset.timed_wait"))
+            stack.enter_context(patch("tt_smi.reset.time", clock))
+            stack.enter_context(
+                patch("tt_smi.reset.should_use_secondary_bus_reset", return_value=True)
+            )
+            topo = stack.enter_context(patch("tt_smi.reset.TopologyDiscovery"))
+            stack.enter_context(patch("tt_smi.reset.get_default_discovery_options"))
             if self.lose_at_reinit or self.reinit_error:
                 topo.discover.side_effect = self.discover
             try:
@@ -753,7 +765,10 @@ class TestFullRecoveryReset:
 
         def run(cmd, **kw):
             res = orig(cmd, **kw)
-            if cmd[:3] == ["sudo", "ipmitool", "raw"] and cmd[7] != GLX_IPMI_OP_MODE_HOLD:
+            if (
+                cmd[:3] == ["sudo", "ipmitool", "raw"]
+                and cmd[7] != GLX_IPMI_OP_MODE_HOLD
+            ):
                 for b in self.TRAY3:
                     host._set(b, "marker")
             return res
