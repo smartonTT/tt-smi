@@ -127,6 +127,7 @@ class FakeGalaxy:
         absent=(),
         drop_on_repower=(),
         reject_per_tray=False,
+        reject_all=False,
         knock_others=False,
         lose_at_reinit=(),
         reinit_error=False,
@@ -140,6 +141,7 @@ class FakeGalaxy:
         self.heal = dict(heal or {})
         self.drop_on_repower = set(drop_on_repower)
         self.reject_per_tray = reject_per_tray
+        self.reject_all = reject_all
         self.knock_others = knock_others
         self.lose_at_reinit = list(lose_at_reinit)
         self.discovers = 0
@@ -200,20 +202,24 @@ class FakeGalaxy:
             for b in bdfs
         }
 
-    mc_info = "ok"  # "ok", "fail" or "timeout"
+    # "ok", "fail" or "timeout"; a list gives one answer per call, its last one repeating.
+    mc_info = "ok"
 
     def run(self, cmd, **kwargs):
         if cmd[:4] == ["sudo", "ipmitool", "mc", "info"]:
             self.mc_calls = getattr(self, "mc_calls", []) + [kwargs.get("timeout")]
-            if self.mc_info == "timeout":
+            answer = self.mc_info
+            if isinstance(answer, list):
+                answer = answer[min(len(self.mc_calls), len(answer)) - 1]
+            if answer == "timeout":
                 raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
             return MagicMock(
-                returncode=0 if self.mc_info == "ok" else 1, stdout="", stderr=""
+                returncode=0 if answer == "ok" else 1, stdout="", stderr=""
             )
         if cmd[:3] == ["sudo", "ipmitool", "raw"]:
             bitmap = int(cmd[5], 16)
             self.ipmi.append((cmd[5], cmd[7]))
-            if self.reject_per_tray and bitmap != 0xF:
+            if self.reject_all or (self.reject_per_tray and bitmap != 0xF):
                 return MagicMock(returncode=1, stdout="", stderr=BMC_C9_STDERR)
             trays = {t for t in (1, 2, 3, 4) if bitmap & (1 << (t - 1))}
             for bdf in self.drop_on_repower:
@@ -479,6 +485,90 @@ class TestFullRecoveryReset:
         assert host.ioctl_ids(IoctlResetFlags.USER_RESET) == []
         assert f"Hardware fault: chip {self.LOST} (tray 2)" in out.err
         assert "UBB" not in out.out + out.err
+
+    def assert_stopped_after_round_1(self, host, code, reinit_ran, out):
+        tray2_ids = sorted(GALAXY_BDFS.index(b) for b in self.TRAY2 if b != self.LOST)
+        assert code == 1 and not reinit_ran
+        # Round 1's SBR + USER_RESET went to tray 2 only; nothing ran after that.
+        assert host.ioctl_ids(IoctlResetFlags.RESET_PCIE_LINK) == [tray2_ids]
+        assert host.ioctl_ids(IoctlResetFlags.USER_RESET) == [tray2_ids]
+        assert "Recovery round 2" not in out.out
+        assert "UBB" not in out.out + out.err
+
+    @pytest.mark.parametrize("mode", ["fail", "timeout"])
+    def test_bmc_gone_after_round_1_stops_before_round_2(self, tmp_path, capsys, mode):
+        # OM-F3-GBH01 24/32 -> 0/32: the BMC answered once, then round 2 would have sent
+        # SBR + USER_RESET to every present chip and re-powered all four trays.
+        host = FakeGalaxy(tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "all"})
+        host.mc_info = ["ok", mode]
+        code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
+        out = capsys.readouterr()
+        assert host.mc_calls == [10, 10]
+        assert host.ipmi == [("0x2", GLX_IPMI_OP_MODE_NO_RETIMER)]  # no 0xF
+        self.assert_stopped_after_round_1(host, code, reinit_ran, out)
+        assert (
+            f"Hardware fault: chip {self.LOST} (tray 2) still missing "
+            f"(in-band IPMI not answering; tray re-power skipped): gone from PCI"
+            in out.err
+        )
+        assert "after tray re-power" not in out.err
+
+    def test_bmc_gone_after_per_tray_failure_skips_all_tray_fallback(
+        self, tmp_path, capsys
+    ):
+        host = FakeGalaxy(
+            tmp_path,
+            states={self.LOST: "gone"},
+            heal={self.LOST: "all"},
+            reject_per_tray=True,
+        )
+        host.mc_info = ["ok", "fail"]
+        code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
+        out = capsys.readouterr()
+        assert host.mc_calls == [10, 10]
+        assert host.ipmi == [("0x2", GLX_IPMI_OP_MODE_NO_RETIMER)]  # no 0xF fallback
+        self.assert_stopped_after_round_1(host, code, reinit_ran, out)
+        assert (
+            f"Hardware fault: chip {self.LOST} (tray 2) still missing "
+            "(in-band IPMI not answering; tray re-power skipped)" in out.err
+        )
+
+    def test_failed_round_1_repower_stops_without_escalating(self, tmp_path, capsys):
+        host = FakeGalaxy(
+            tmp_path,
+            states={self.LOST: "gone"},
+            heal={self.LOST: "all"},
+            reject_all=True,
+        )
+        code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
+        out = capsys.readouterr()
+        # Per-tray 0x2, then the 0xF fallback (BMC still answers) and its legacy retry fail.
+        assert host.ipmi == [
+            ("0x2", GLX_IPMI_OP_MODE_NO_RETIMER),
+            ("0xF", GLX_IPMI_OP_MODE_NO_RETIMER),
+            ("0xF", GLX_IPMI_OP_MODE_WITH_RETIMER),
+        ]
+        assert host.mc_calls == [10, 10]
+        self.assert_stopped_after_round_1(host, code, reinit_ran, out)
+        assert (
+            f"Hardware fault: chip {self.LOST} (tray 2) still missing "
+            "(re-power of tray(s) 2 failed (IPMI command failed:" in out.err
+        )
+
+    def test_reinit_path_bmc_gone_after_round_1_stops(self, tmp_path, capsys):
+        lost = "0000:45:00.0"  # tray 2; read all ones at re-init, heals only on 0xF
+        host = FakeGalaxy(tmp_path, lose_at_reinit=[lost])
+        host.mc_info = ["ok", "fail"]
+        # Round 1 re-powers tray 2 only; the chip needs all four trays (round 2).
+        code, _, _ = host.reset(ok=True)
+        err = capsys.readouterr().err
+        assert code == 1
+        assert host.discovers == 1
+        assert [b for b, _ in host.ipmi] == ["0x2"]
+        assert (
+            f"Hardware fault: chip {lost} (tray 2) still missing "
+            "(in-band IPMI not answering; tray re-power skipped)" in err
+        )
 
     def test_umd_missing_list_alone_triggers_recovery(self, tmp_path, capsys):
         # UMD names the chip even though its sysfs config still reads fine.

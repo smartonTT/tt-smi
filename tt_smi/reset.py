@@ -223,10 +223,18 @@ def _tray_ipmi_reset(trays: List[int]) -> None:
             f"Per-tray IPMI reset of tray(s) {', '.join(map(str, trays))} failed:\n{failure}\n"
             f"{CMD_LINE_COLOR.BLUE}Resetting all four trays of this host instead...{CMD_LINE_COLOR.ENDC}"
         )
+        # The per-tray failure may be the BMC going away: check again before the 0xF reset.
+        if not _ipmi_answers():
+            raise IpmiNotAnswering(IPMI_SKIPPED)
     run_galaxy_ipmi_reset("0xF", "0xFF", GLX_IPMI_OP_MODE_NO_RETIMER, "0xF")
 
 
 IPMI_CHECK_TIMEOUT_S = 10
+IPMI_SKIPPED = "in-band IPMI not answering; tray re-power skipped"
+
+
+class IpmiNotAnswering(RuntimeError):
+    """The BMC did not answer ``ipmitool mc info`` before a re-power step."""
 
 
 def _ipmi_answers() -> bool:
@@ -278,20 +286,13 @@ def recover_missing_chips(
     round 1 only those trays, round 2 all four trays of this host), rescans PCI and
     recounts the missing chips and, after a re-power, every chip of ``known`` (a re-power can
     knock other trays off PCI too), so those feed the next round.
-    Returns the chips (by BDF) and short trays (tray -> chips present) still missing afterwards.
+    Before each re-power (and before the all-tray fallback) the BMC must answer
+    ``ipmitool mc info``; if it does not, or a re-power fails, recovery stops there: no
+    further SBR, USER_RESET or re-power.
+    Returns the chips (by BDF) and short trays (tray -> chips present) still missing afterwards,
+    and why recovery stopped early (None if it did not).
     """
     allow_repower = repower
-    if is_galaxy and allow_repower and not _ipmi_answers():
-        # A re-power with no BMC answer can take healthy chips down (OM-F3-GBH01: 24/32 to 0/32),
-        # so touch nothing: no SBR, USER_RESET or re-power.
-        print(
-            CMD_LINE_COLOR.RED,
-            "In-band IPMI (ipmitool mc info) did not answer within "
-            f"{IPMI_CHECK_TIMEOUT_S} s: no tray re-power, no SBR or USER_RESET on any chip.",
-            CMD_LINE_COLOR.ENDC,
-            file=sys.stderr,
-        )
-        return sorted(missing), short_trays
     for round_num in range(1, RECOVERY_MAX_ROUNDS + 1):
         trays = sorted(
             {tray_of_bdf(b, wormhole) for b in missing} | set(short_trays), key=str
@@ -299,6 +300,17 @@ def recover_missing_chips(
         if is_galaxy and allow_repower:
             # A chip on a bus outside the tray map gets all four trays re-powered.
             repower = list(GALAXY_TRAYS) if round_num > 1 or None in trays else trays
+            # A re-power with no BMC answer can take healthy chips down (OM-F3-GBH01: 24/32
+            # to 0/32), so check before every round: no answer, no SBR, USER_RESET or re-power.
+            if not _ipmi_answers():
+                print(
+                    CMD_LINE_COLOR.RED,
+                    "In-band IPMI (ipmitool mc info) did not answer within "
+                    f"{IPMI_CHECK_TIMEOUT_S} s: no tray re-power, no SBR or USER_RESET on any chip.",
+                    CMD_LINE_COLOR.ENDC,
+                    file=sys.stderr,
+                )
+                return sorted(missing), short_trays, IPMI_SKIPPED
             print(
                 CMD_LINE_COLOR.PURPLE,
                 f"Recovery round {round_num}/{RECOVERY_MAX_ROUNDS}: re-powering tray(s) "
@@ -308,12 +320,20 @@ def recover_missing_chips(
             try:
                 _repower_trays(repower, wormhole)
             except RuntimeError as e:
+                # Stop: escalating after a failed re-power can take down healthy trays too.
+                stopped = (
+                    str(e)
+                    if isinstance(e, IpmiNotAnswering)
+                    else f"re-power of tray(s) {', '.join(map(str, repower))} failed ({e}); "
+                    "no further re-power"
+                )
                 print(
                     CMD_LINE_COLOR.RED,
-                    f"Tray re-power failed: {e}",
+                    f"Tray re-power failed: {e}. Recovery stops: no further SBR, USER_RESET or re-power.",
                     CMD_LINE_COLOR.ENDC,
                     file=sys.stderr,
                 )
+                return sorted(missing), short_trays, stopped
         else:
             repower = []
             print(f"Recovery round {round_num}/{RECOVERY_MAX_ROUNDS}: PCI rescan...")
@@ -364,7 +384,7 @@ def recover_missing_chips(
             )
         if not missing and not short_trays:
             break
-    return missing, short_trays
+    return missing, short_trays, None
 
 
 def _ipmi_output_is_param_out_of_range(output: str) -> bool:
@@ -622,7 +642,7 @@ def _recover_after_failed_reinit() -> bool:
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
         )
-    still, still_short = recover_missing_chips(
+    still, still_short, stopped = recover_missing_chips(
         lost, short_trays, is_galaxy, wormhole, known=bdfs, repower=True
     )
     if not still and not still_short:
@@ -632,19 +652,19 @@ def _recover_after_failed_reinit() -> bool:
             CMD_LINE_COLOR.ENDC,
         )
         return True
+    how = f"({stopped})" if stopped else "after tray re-power and PCI rescan"
     for bdf in still:
         print(
             CMD_LINE_COLOR.RED,
-            f"Hardware fault: chip {_chip_label(bdf, is_galaxy, wormhole)} still missing after "
-            f"tray re-power and PCI rescan: {chip_reset_state(bdf, check_marker=False)}",
+            f"Hardware fault: chip {_chip_label(bdf, is_galaxy, wormhole)} still missing {how}: "
+            f"{chip_reset_state(bdf, check_marker=False)}",
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
         )
     for tray, count in sorted(still_short.items()):
         print(
             CMD_LINE_COLOR.RED,
-            f"Hardware fault: tray {tray} has {count}/{GALAXY_CHIPS_PER_TRAY} chips after "
-            "tray re-power and PCI rescan",
+            f"Hardware fault: tray {tray} has {count}/{GALAXY_CHIPS_PER_TRAY} chips {how}",
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
         )
@@ -760,7 +780,7 @@ def umd_pci_warm_reset(
         raise ResetFailedError(failed)
 
     # Only a full reset re-powers trays: a targeted reset rescans PCI at most.
-    still, still_short = recover_missing_chips(
+    still, still_short, stopped = recover_missing_chips(
         failed, short_trays, is_galaxy, wormhole, known=bdfs, repower=full
     )
     if not still and not still_short:
@@ -776,11 +796,16 @@ def umd_pci_warm_reset(
             CMD_LINE_COLOR.ENDC,
         )
         return
-    how = "tray re-power and PCI rescan" if is_galaxy and full else "PCI rescan"
+    how = (
+        f"({stopped})"
+        if stopped
+        else "after "
+        + ("tray re-power and PCI rescan" if is_galaxy and full else "PCI rescan")
+    )
     for bdf in still:
         print(
             CMD_LINE_COLOR.RED,
-            f"Hardware fault: chip {_chip_label(bdf, is_galaxy, wormhole)} still missing after {how}: "
+            f"Hardware fault: chip {_chip_label(bdf, is_galaxy, wormhole)} still missing {how}: "
             f"{chip_reset_state(bdf, check_marker=False)}",
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
@@ -798,7 +823,7 @@ def umd_pci_warm_reset(
         if tray not in named:
             print(
                 CMD_LINE_COLOR.RED,
-                f"Hardware fault: tray {tray} has {count}/{GALAXY_CHIPS_PER_TRAY} chips after {how} "
+                f"Hardware fault: tray {tray} has {count}/{GALAXY_CHIPS_PER_TRAY} chips {how} "
                 "(the missing chip was not on PCI before the reset, so its BDF is not known)",
                 CMD_LINE_COLOR.ENDC,
                 file=sys.stderr,
