@@ -106,6 +106,20 @@ def chip_reset_state(bdf: str, check_marker: bool = True) -> str:
     return "ok"
 
 
+def fault_state(bdf: str) -> str:
+    """Hedged ``chip_reset_state`` text for a final fault line (the marker only suggests no reset)."""
+    state = chip_reset_state(bdf)
+    if state.startswith("reset marker"):
+        return "reset marker still set (chip may not have reset)"
+    if state == "ok":
+        return "reads back on PCI, but its tray may still be held in reset"
+    return state
+
+
+class TrayHeldError(RuntimeError):
+    """The release pulse failed after a hold: the tray may still be held in reset."""
+
+
 def tray_of_bdf(bdf: str, wormhole: bool = False) -> Optional[int]:
     """Galaxy tray 1-4 of the chip at ``bdf`` (PCI bus & 0xF0), or None."""
     try:
@@ -340,11 +354,12 @@ def _repower_trays(
             )
             print(
                 CMD_LINE_COLOR.RED,
-                f"Tray(s) {', '.join(map(str, hold))} are still held in reset: the release "
+                f"Tray(s) {', '.join(map(str, hold))} may still be held in reset: the release "
                 f"pulse failed ({e}). Release them in-band with: {release}",
                 CMD_LINE_COLOR.ENDC,
                 file=sys.stderr,
             )
+            raise TrayHeldError(str(e)) from e
         raise
     timed_wait(TRAY_REPOWER_WAIT_S)
 
@@ -405,6 +420,7 @@ def recover_missing_chips(
     """
     allow_repower = repower
     stopped = None
+    held_unverified: set = set()
     # A chip whose reset marker is set after the warm reset was not reset, and the plain
     # 0x3 pulse does not reset a live tray (task #3791, 2/2): round 1 holds its tray.
     hold: set = {
@@ -444,6 +460,14 @@ def recover_missing_chips(
                     repower, wormhole, user_reset, tuple(sorted(hold & set(repower)))
                 )
             except RuntimeError as e:
+                if isinstance(e, TrayHeldError):
+                    # The recount may find these chips, but the tray may still be held: the
+                    # reset must not exit 0 after saying so.
+                    held_unverified |= {
+                        b
+                        for b in set(missing) | set(known or [])
+                        if tray_of_bdf(b, wormhole) in hold
+                    }
                 # Stop: escalating after a failed re-power can take down healthy trays too.
                 stopped = (
                     str(e)
@@ -529,6 +553,7 @@ def recover_missing_chips(
             )
         if stopped or (not missing and not short_trays):
             break
+    missing = sorted(set(missing) | held_unverified)
     return missing, short_trays, stopped if (missing or short_trays) else None
 
 
@@ -802,7 +827,7 @@ def _recover_after_failed_reinit() -> bool:
         print(
             CMD_LINE_COLOR.RED,
             f"Hardware fault: chip {_chip_label(bdf, is_galaxy, wormhole)} still missing {how}: "
-            f"{chip_reset_state(bdf)}",
+            f"{fault_state(bdf)}",
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
         )
@@ -951,7 +976,7 @@ def umd_pci_warm_reset(
         print(
             CMD_LINE_COLOR.RED,
             f"Hardware fault: chip {_chip_label(bdf, is_galaxy, wormhole)} still missing {how}: "
-            f"{chip_reset_state(bdf)}",
+            f"{fault_state(bdf)}",
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
         )

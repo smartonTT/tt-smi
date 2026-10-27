@@ -126,6 +126,7 @@ class FakeGalaxy:
     lose_at_reinit_heal = "tray"
     reject_hold = False
     reject_pulse_after_hold = False
+    hold_leaves_chips_up = False
 
     def __init__(
         self,
@@ -242,6 +243,8 @@ class FakeGalaxy:
                 if self.reject_hold:
                     return MagicMock(returncode=1, stdout="", stderr=BMC_C9_STDERR)
                 for bdf in self.bdfs:
+                    if self.hold_leaves_chips_up:
+                        break
                     if self.tray(bdf) in trays and self.state[bdf] != "gone":
                         self.held[bdf] = self.state[bdf]
                         self._set(bdf, "ones")
@@ -791,8 +794,22 @@ class TestFullRecoveryReset:
         err = capsys.readouterr().err
         assert code == 1
         assert not reinit_ran
-        assert "Tray(s) 3 are still held in reset" in err
+        assert "Tray(s) 3 may still be held in reset" in err
         assert "raw 0x30 0x8B 0x4 0xFF 0x3 0xF" in err
+
+    def test_hold_leaves_chips_up_pulse_fails_exits_non_zero(self, tmp_path, capsys):
+        # The hold timed out with the chips still on PCI and the pulse raised: the recount
+        # finds every chip, but the tray may still be held, so the reset must not exit 0.
+        host = FakeGalaxy(tmp_path, states={b: "marker" for b in self.TRAY3})
+        host.hold_leaves_chips_up = True
+        host.reject_pulse_after_hold = True
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        err = capsys.readouterr().err
+        assert code == 1
+        assert not reinit_ran
+        assert "may still be held in reset" in err
+        assert "tray 3) still missing" in err
+        assert "(chip may not have reset)" in err
 
     def test_hold_accepted_fallback_fails_names_the_held_tray(self, tmp_path, capsys):
         host = FakeGalaxy(tmp_path, states={b: "marker" for b in self.TRAY3})
@@ -800,7 +817,7 @@ class TestFullRecoveryReset:
         code, _, _ = host.reset(ok=False, missing=self.TRAY3)
         err = capsys.readouterr().err
         assert code == 1
-        assert "Tray(s) 3 are still held in reset" in err
+        assert "Tray(s) 3 may still be held in reset" in err
 
     def test_live_tray_the_hold_does_not_reset_is_a_hardware_fault(
         self, tmp_path, capsys
@@ -818,7 +835,7 @@ class TestFullRecoveryReset:
         ]
         assert (
             "Hardware fault: chip 0000:c1:00.0 (tray 3) still missing after tray re-power "
-            "and PCI rescan: reset marker still set (chip did not reset)" in err
+            "and PCI rescan: reset marker still set (chip may not have reset)" in err
         )
 
     def test_rejected_hold_stops_recovery(self, tmp_path, capsys):
