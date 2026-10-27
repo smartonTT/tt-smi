@@ -1456,7 +1456,7 @@ class TestInboxLinksAfterRepower:
         )
         assert "Fault: chip 0000:47:00.0 (tray 2) in-box ETH link(s) down" in out.err
         assert "0000:04:00.0" not in out.err
-        assert "6 chip(s) did not come back" in out.err
+        assert "in-box ETH link(s) down, all chips on PCI" in out.err
 
     def test_healthy_reset_reads_no_links_and_repowers_nothing(self, tmp_path):
         host = FakeGalaxy(tmp_path, eth_drop="never")
@@ -1523,7 +1523,26 @@ class TestInboxLinksAfterRepower:
         ) in out.err
         for bdf in ("05", "06", "07", "45", "46"):
             assert f"Fault: chip 0000:{bdf}:00.0" in out.err
-        assert "6 chip(s) did not come back" in out.err
+        assert "6 in-box ETH link(s) down, all chips on PCI" in out.err
+        assert "0000:07:00.0 (tray 1) ch 6 <-> 0000:47:00.0 (tray 2) ch 6" in out.err
+        assert "chip(s) did not come back" not in out.err
+
+    def test_both_sides_first_even_if_other_repowered_trays_cover_all(self, capsys):
+        # Trays 3 and 4 re-powered, links down between trays 1 and 2: trays 1 and 2 first.
+        down = {((1, 5, 6), (2, 5, 6))}
+        reads = iter([(True, down), (True, set())])
+        calls = []
+
+        def recover(missing, short, *a, **k):
+            calls.append(sorted(short))
+            return [], {}, None
+
+        with patch("tt_smi.reset._wait_links", lambda *a, **k: next(reads)), patch(
+            "tt_smi.reset.recover_missing_chips", recover
+        ), patch("tt_smi.reset._present_chips", return_value={}):
+            check_inbox_links_after_repower({3, 4}, True, False)
+        assert calls == [[1, 2]]
+        assert "In-box ETH links back" in capsys.readouterr().out
 
     def test_links_unreadable_after_repower_escalate_then_fail(self, tmp_path, capsys):
         host = self._host(tmp_path, eth_drop="never", eth_unreadable="after_first")

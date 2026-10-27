@@ -64,8 +64,16 @@ TRAY_HOLD_RELEASE_WAIT_S = 10
 class ResetFailedError(Exception):
     """Warm reset failed; ``bdfs`` lists the chips that did not come back."""
 
-    def __init__(self, bdfs: List[str]):
+    def __init__(self, bdfs: List[str], links_down: Optional[List[str]] = None):
         self.bdfs = bdfs
+        self.links_down = links_down
+        if links_down:
+            # All chips are on PCI; only in-box ETH links stay down.
+            super().__init__(
+                f"Warm reset failed ({len(links_down)} in-box ETH link(s) down, "
+                f"all chips on PCI: {'; '.join(links_down)})"
+            )
+            return
         names = ", ".join(bdfs) if bdfs else "no chip named"
         super().__init__(
             f"Warm reset failed ({len(bdfs)} chip(s) did not come back: {names})"
@@ -758,7 +766,9 @@ def check_inbox_links_after_repower(
         return
     steps = []
     both = sorted({end[0] for link in down for end in link})
-    if set(both) | set(repowered) != set(GALAXY_TRAYS):
+    # Both sides of each down link first, then all trays (goal 17, #4063): trays re-powered
+    # earlier still get their turn, so only skip when the links span every tray.
+    if set(both) != set(GALAXY_TRAYS):
         steps.append((both, "both sides of each down link"))
     steps.append((list(GALAXY_TRAYS), "all trays"))
     for trays, why in steps:
@@ -846,7 +856,12 @@ def check_inbox_links_after_repower(
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
         )
-    raise ResetFailedError([_chip_label(b, True, wormhole) for b in sorted(per_chip)])
+    links = [
+        f"{_chip_label(bdf_of(a), True, wormhole)} ch {a[2]} <-> "
+        f"{_chip_label(bdf_of(b), True, wormhole)} ch {b[2]}"
+        for a, b in sorted(down)
+    ]
+    raise ResetFailedError([_chip_label(b, True, wormhole) for b in sorted(per_chip)], links)
 
 
 def _ipmi_output_is_param_out_of_range(output: str) -> bool:
