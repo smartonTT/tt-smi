@@ -861,7 +861,9 @@ def check_inbox_links_after_repower(
         f"{_chip_label(bdf_of(b), True, wormhole)} ch {b[2]}"
         for a, b in sorted(down)
     ]
-    raise ResetFailedError([_chip_label(b, True, wormhole) for b in sorted(per_chip)], links)
+    raise ResetFailedError(
+        [_chip_label(b, True, wormhole) for b in sorted(per_chip)], links
+    )
 
 
 def _ipmi_output_is_param_out_of_range(output: str) -> bool:
