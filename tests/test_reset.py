@@ -1033,7 +1033,7 @@ class TestFullRecoveryReset:
         def late(bdf, *a, **k):
             if st["armed"]:
                 st["n"] += 1
-                if st["n"] <= 7:  # first poll of the 7 held chips
+                if st["n"] <= len(self.TRAY3):  # first poll of every held chip
                     return "gone"
             return real(bdf, *a, **k)
 
