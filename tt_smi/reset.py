@@ -803,7 +803,9 @@ def _target_bdfs(reset_input: SmiDeviceInput, chips) -> List[str]:
 
 def _umd_unreadable_ids(err: Exception) -> List[int]:
     """Chip ids tt-umd discovery read 0xffffffff from ("Read 0xffffffff over PCIe ID 8")."""
-    return sorted({int(i) for i in re.findall(r"0xffffffff over PCIe ID (\d+)", str(err))})
+    return sorted(
+        {int(i) for i in re.findall(r"0xffffffff over PCIe ID (\d+)", str(err))}
+    )
 
 
 def _recover_after_failed_reinit(err: Exception, all_trays: bool = False) -> bool:

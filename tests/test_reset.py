@@ -1085,7 +1085,9 @@ class TestFullRecoveryReset:
         assert code == 1
         assert host.discovers == 3
         assert [b for b, _ in host.ipmi] == ["0x2", "0xF"]
-        assert "Error when re-initializing chips after recovery" in capsys.readouterr().out
+        assert (
+            "Error when re-initializing chips after recovery" in capsys.readouterr().out
+        )
 
     def test_reinit_failure_with_no_lost_chip_exits_without_repower(self, tmp_path):
         host = FakeGalaxy(tmp_path, reinit_error=True)
