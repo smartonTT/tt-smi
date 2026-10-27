@@ -110,12 +110,16 @@ class FakeGalaxy:
 
     ``states``: bdf -> ok, marker, ones or gone (default ok). ``heal``: bdf -> how a chip
     that is not ok comes back: "tray" (its tray re-powered), "all" (all four trays
-    re-powered), "rescan" (UMD PCI rescan), "sysfs" (sysfs PCI rescan) or "never" (default). ``drop_on_repower``: chips lost
+    re-powered), "rescan" (UMD PCI rescan), "sysfs" (sysfs PCI rescan), "post" (POST_RESET
+    sent to it) or "never" (default). ``drop_on_repower``: chips lost
     when their tray is re-powered. ``knock_others``: the first per-tray re-power leaves the
-    chips of every other tray reading all ones until all four trays are re-powered.
-    ``lose_at_reinit``: chips that read all ones at the first re-init (healed by an all-tray
-    re-power); with it, re-init fails while any chip is not ok.
+    chips of every other tray reading all ones until their own tray is re-powered.
+    ``lose_at_reinit``: chips that read all ones at the first re-init (healed as
+    ``lose_at_reinit_heal`` says, default their tray re-powered); with it, re-init fails while
+    any chip is not ok. ``post_reset_fail``: chips whose POST_RESET ioctl fails.
     """
+
+    lose_at_reinit_heal = "tray"
 
     def __init__(
         self,
@@ -131,6 +135,7 @@ class FakeGalaxy:
         knock_others=False,
         lose_at_reinit=(),
         reinit_error=False,
+        post_reset_fail=(),
     ):
         self.root = tmp_path / "devices"
         self.root.mkdir()
@@ -146,6 +151,7 @@ class FakeGalaxy:
         self.lose_at_reinit = list(lose_at_reinit)
         self.discovers = 0
         self.reinit_error = reinit_error
+        self.post_reset_fail = set(post_reset_fail)
         self.ipmi = []
         self.ioctls = []
         self.state = {b: "ok" for b in self.bdfs}
@@ -230,7 +236,7 @@ class FakeGalaxy:
                 for bdf in self.bdfs:
                     if self.tray(bdf) not in trays and self.state[bdf] == "ok":
                         self._set(bdf, "ones")
-                        self.heal[bdf] = "all"
+                        self.heal[bdf] = "tray"
             self._heal(("all",) if bitmap == 0xF else ())
             for bdf, mode in self.heal.items():
                 if mode == "tray" and self.tray(bdf) in trays:
@@ -248,7 +254,7 @@ class FakeGalaxy:
         if self.discovers == 1:
             for bdf in self.lose_at_reinit:
                 self._set(bdf, "ones")
-                self.heal[bdf] = "all"
+                self.heal[bdf] = self.lose_at_reinit_heal
         bad = [b for b in self.bdfs if self.state[b] != "ok"]
         if self.reinit_error:
             raise RuntimeError("Ethernet training timed out")
@@ -257,7 +263,14 @@ class FakeGalaxy:
 
     def ioctl(self, ids, flag):
         self.ioctls.append((flag, sorted(ids)))
-        return []
+        if flag != IoctlResetFlags.POST_RESET:
+            return []
+        for i in ids:
+            bdf = self.bdfs[i]
+            if self.heal.get(bdf) == "post" and bdf not in self.post_reset_fail:
+                self._set(bdf, "ok")
+                self.heal[bdf] = "done"
+        return [i for i in ids if self.bdfs[i] in self.post_reset_fail]
 
     def ioctl_ids(self, flag):
         return [ids for f, ids in self.ioctls if f == flag]
@@ -559,13 +572,14 @@ class TestFullRecoveryReset:
         )
 
     class Round2Rejected(FakeGalaxy):
-        """Round 1's per-tray re-power works but leaves the chip gone; round 2's 0xF is
-        rejected, and its USER_RESET leaves ``knocked`` reading all ones."""
+        """Round 1's per-tray re-power works but leaves the chip gone; round 2's re-power
+        (and its 0xF fallback) is rejected, and its USER_RESET leaves ``knocked`` reading all
+        ones."""
 
         knocked = ()
 
         def run(self, cmd, **kwargs):
-            if cmd[:3] == ["sudo", "ipmitool", "raw"] and int(cmd[5], 16) == 0xF:
+            if cmd[:3] == ["sudo", "ipmitool", "raw"] and self.ipmi:
                 self.reject_all = True
             return super().run(cmd, **kwargs)
 
@@ -578,23 +592,24 @@ class TestFullRecoveryReset:
     def test_failed_round_2_repower_still_post_resets_and_names_every_chip(
         self, tmp_path, capsys
     ):
-        knocked = ["0000:02:00.0", "0000:c1:00.0"]  # trays 1 and 3
+        knocked = ["0000:41:00.0", "0000:42:00.0"]  # tray 2, like the lost chip
         host = self.Round2Rejected(
             tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "all"}
         )
         host.knocked = knocked
         code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
         out = capsys.readouterr()
-        present = sorted(GALAXY_BDFS.index(b) for b in GALAXY_BDFS if b != self.LOST)
+        present = sorted(GALAXY_BDFS.index(b) for b in self.TRAY2 if b != self.LOST)
         assert code == 1 and not reinit_ran
-        assert [b for b, _ in host.ipmi] == ["0x2", "0xF", "0xF"]  # 0xF + legacy retry
-        # Round 2's SBR + USER_RESET reached all 31 present chips, and so does POST_RESET.
+        # Round 2: tray 2 again, then the 0xF fallback and its legacy retry, all rejected.
+        assert [b for b, _ in host.ipmi] == ["0x2", "0x2", "0xF", "0xF"]
+        # Round 2's SBR + USER_RESET reached tray 2's 7 present chips, and so does POST_RESET.
         assert host.ioctl_ids(IoctlResetFlags.USER_RESET)[-1] == present
         assert host.ioctl_ids(IoctlResetFlags.POST_RESET)[-1] == present
         assert len(host.ioctl_ids(IoctlResetFlags.USER_RESET)) == 2  # nothing after
-        assert "Recount after round 2: 31/32 chips" in out.out
-        how = "(re-power of tray(s) 1, 2, 3, 4 failed (IPMI command failed:"
-        for bdf, tray in [(self.LOST, 2), (knocked[0], 1), (knocked[1], 3)]:
+        assert "Recount after round 2: 29/32 chips" in out.out
+        how = "(re-power of tray(s) 2 failed (IPMI command failed:"
+        for bdf, tray in [(self.LOST, 2), (knocked[0], 2), (knocked[1], 2)]:
             assert f"Hardware fault: chip {bdf} (tray {tray}) still missing {how}" in (
                 out.err
             )
@@ -617,10 +632,11 @@ class TestFullRecoveryReset:
         ]
 
     def test_reinit_path_bmc_gone_after_round_1_stops(self, tmp_path, capsys):
-        lost = "0000:45:00.0"  # tray 2; read all ones at re-init, heals only on 0xF
+        lost = "0000:45:00.0"  # tray 2; read all ones at re-init, never heals
         host = FakeGalaxy(tmp_path, lose_at_reinit=[lost])
+        host.lose_at_reinit_heal = "never"
         host.mc_info = ["ok", "fail"]
-        # Round 1 re-powers tray 2 only; the chip needs all four trays (round 2).
+        # Round 1 re-powers tray 2 only; the chip stays lost, round 2 finds no BMC answer.
         code, _, _ = host.reset(ok=True)
         err = capsys.readouterr().err
         assert code == 1
@@ -653,13 +669,59 @@ class TestFullRecoveryReset:
             ("0xF", GLX_IPMI_OP_MODE_NO_RETIMER),
         ]
 
-    def test_round_two_repowers_all_trays(self, tmp_path, capsys):
-        host = FakeGalaxy(tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "all"})
-        code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
+    TRAY3 = [b for b in GALAXY_BDFS if b.startswith("0000:c")]
+
+    def test_round_1_recount_full_runs_no_round_2(self, tmp_path, capsys):
+        # OM-E4-GBH02 try 2 (01:48 PDT 10-27): tray 3 held in reset, c1-c8:00.0 read all ones.
+        # After round 1's tray 3 re-power they read back only once POST_RESET was sent; the
+        # check before POST_RESET counted them missing, so round 2 re-powered all four trays,
+        # printed "Hardware fault ... still missing ...: ok" and exited 1 on a 32/32 box.
+        host = FakeGalaxy(
+            tmp_path,
+            states={b: "ones" for b in self.TRAY3},
+            heal={b: "post" for b in self.TRAY3},
+        )
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
         assert code is None and reinit_ran
-        assert [b for b, _ in host.ipmi] == ["0x2", "0xF"]
-        assert host.ioctl_ids(IoctlResetFlags.POST_RESET)[-1] == list(range(32))
-        assert "Recount after round 2: 32/32 chips" in capsys.readouterr().out
+        assert host.ipmi == [("0x4", GLX_IPMI_OP_MODE_NO_RETIMER)]  # tray 3 only, once
+        tray3_ids = sorted(GALAXY_BDFS.index(b) for b in self.TRAY3)
+        assert host.ioctl_ids(IoctlResetFlags.USER_RESET) == [tray3_ids]
+        assert host.ioctl_ids(IoctlResetFlags.POST_RESET) == [tray3_ids]
+        assert "Recount after round 1: 32/32 chips" in out.out
+        assert "Recovery round 2" not in out.out
+        assert "Hardware fault" not in out.err
+        assert "Recovered: all 8 missing chip(s) are back" in out.out
+        assert all(state == "ok" for state in host.state.values())
+
+    def test_tray_that_stays_down_is_the_only_tray_repowered(self, tmp_path, capsys):
+        # A whole tray that never comes back: both rounds re-power tray 3 alone (trays 1, 2
+        # and 4 have every chip), and every chip of it is named by BDF and tray.
+        host = FakeGalaxy(tmp_path, states={b: "ones" for b in self.TRAY3})
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
+        assert code == 1 and not reinit_ran
+        assert [b for b, _ in host.ipmi] == ["0x4", "0x4"]
+        tray3_ids = sorted(GALAXY_BDFS.index(b) for b in self.TRAY3)
+        assert host.ioctl_ids(IoctlResetFlags.USER_RESET) == [tray3_ids, tray3_ids]
+        assert "Recount after round 2: 24/32 chips" in out.out
+        for bdf in self.TRAY3:
+            assert (
+                f"Hardware fault: chip {bdf} (tray 3) still missing after tray re-power "
+                "and PCI rescan: config space reads all ones" in out.err
+            )
+        assert out.err.count("Hardware fault: chip") == 8
+        assert "UBB" not in out.out + out.err
+
+    def test_round_two_repowers_only_trays_still_missing_a_chip(self, tmp_path, capsys):
+        # Round 1 brings tray 2 back but not tray 3's dead chip: round 2 re-powers tray 3 only.
+        dead = "0000:c3:00.0"
+        host = FakeGalaxy(
+            tmp_path, states={self.LOST: "gone", dead: "ones"}, heal={self.LOST: "tray"}
+        )
+        code, _, _ = host.reset(ok=False, missing=[self.LOST, dead])
+        assert code == 1
+        assert [b for b, _ in host.ipmi] == ["0x6", "0x4"]
 
     def test_chip_that_never_returns_is_a_hardware_fault(self, tmp_path, capsys):
         host = FakeGalaxy(tmp_path, states={self.LOST: "gone"})
@@ -667,7 +729,7 @@ class TestFullRecoveryReset:
         out = capsys.readouterr()
         assert code == 1
         assert not reinit_ran
-        assert [b for b, _ in host.ipmi] == ["0x2", "0xF"]  # at most two rounds
+        assert [b for b, _ in host.ipmi] == ["0x2", "0x2"]  # at most two rounds, tray 2
         assert (
             f"Hardware fault: chip {self.LOST} (tray 2) still missing after tray re-power and PCI rescan: gone from PCI"
             in out.err
@@ -714,7 +776,7 @@ class TestFullRecoveryReset:
         code, reinit_ran, _ = host.reset(ok=False, missing=[lost])
         out = capsys.readouterr().out
         assert code is None and reinit_ran
-        assert [m for m, _ in host.ipmi] == ["0x4", "0xF"]
+        assert [m for m, _ in host.ipmi] == ["0x4", "0xB"]  # trays 1, 2 and 4
         assert "Recount after round 2: 32/32 chips" in out
         assert all(state == "ok" for state in host.state.values())
 
@@ -729,7 +791,7 @@ class TestFullRecoveryReset:
         assert host.discovers == 2
         assert f"Chip {lost} (tray 1) lost after the recount" in out.err
         assert "re-initializing again" in out.out
-        assert host.ipmi[-1][0] == "0xF"
+        assert host.ipmi == [("0x1", GLX_IPMI_OP_MODE_NO_RETIMER)]  # tray 1 only
 
     def test_reinit_failure_with_no_lost_chip_exits_without_repower(self, tmp_path):
         host = FakeGalaxy(tmp_path, reinit_error=True)
@@ -910,18 +972,42 @@ class TestFullRecoveryReset:
             in capsys.readouterr().err
         )
 
-    def test_post_reset_failure_is_not_a_recovery(self, tmp_path):
+    @pytest.mark.parametrize("reinit_error", [False, True])
+    def test_post_reset_failure_on_a_chip_that_reads_back_is_left_to_reinit(
+        self, tmp_path, capsys, reinit_error
+    ):
+        # A chip back on PCI whose POST_RESET fails is present: no round 2, no hardware
+        # fault; the re-init judges it, and a failed re-init still exits non-zero.
         host = FakeGalaxy(
-            tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"}
+            tmp_path,
+            states={self.LOST: "gone"},
+            heal={self.LOST: "tray"},
+            post_reset_fail=[self.LOST],
+            reinit_error=reinit_error,
         )
-        bad = GALAXY_BDFS.index(self.LOST)
-        host.ioctl = lambda ids, flag: (
-            host.ioctls.append((flag, sorted(ids)))
-            or ([bad] if flag == IoctlResetFlags.POST_RESET else [])
+        code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
+        out = capsys.readouterr()
+        assert reinit_ran
+        assert code == (1 if reinit_error else None)
+        assert host.ipmi == [("0x2", GLX_IPMI_OP_MODE_NO_RETIMER)]
+        assert "Recovery round 2" not in out.out
+        assert "Hardware fault" not in out.err
+        assert f"({self.LOST} (tray 2)). The chip reads back on PCI" in out.err
+        assert "Recount after round 1: 32/32 chips" in out.out
+
+    def test_post_reset_failure_on_a_chip_still_gone_is_not_a_recovery(
+        self, tmp_path, capsys
+    ):
+        host = FakeGalaxy(
+            tmp_path, states={self.LOST: "gone"}, post_reset_fail=[self.LOST]
         )
         code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
         assert code == 1
         assert not reinit_ran
+        assert (
+            f"Hardware fault: chip {self.LOST} (tray 2) still missing"
+            in capsys.readouterr().err
+        )
 
 
 class TestParseResetInput:

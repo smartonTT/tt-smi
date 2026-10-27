@@ -77,6 +77,8 @@ WORMHOLE_DEVICE_ID = 0x401E
 RECOVERY_MAX_ROUNDS = 2
 TRAY_REPOWER_WAIT_S = 30
 CHIP_RETURN_TIMEOUT_S = 60
+# Recount after POST_RESET: chips already back read ok at once.
+POST_RESET_RECHECK_S = 10
 
 
 def chip_reset_state(bdf: str, check_marker: bool = True) -> str:
@@ -279,6 +281,35 @@ def _repower_trays(
     timed_wait(TRAY_REPOWER_WAIT_S)
 
 
+def _recount(
+    missing: List[str],
+    known: Optional[List[str]],
+    count_trays: bool,
+    is_galaxy: bool,
+    wormhole: bool,
+    timeout_s: float,
+) -> Tuple[Dict[int, str], List[str], Dict[int, int]]:
+    """Wait up to ``timeout_s`` for the ``missing`` and ``known`` chips to read back on PCI.
+
+    Returns the chips the driver sees (id -> BDF), the chips still not back (not on PCI,
+    or config not reading back) and the short Galaxy trays (counted when ``count_trays``).
+    """
+    deadline = time.monotonic() + timeout_s
+    check = set(missing) | set(known or [])
+    while True:
+        present = _present_chips()
+        bdfs = set(present.values())
+        still = sorted(
+            b
+            for b in check
+            if b not in bdfs or chip_reset_state(b, check_marker=False) != "ok"
+        )
+        short = _short_trays(bdfs, wormhole) if is_galaxy and count_trays else {}
+        if (not still and not short) or time.monotonic() >= deadline:
+            return present, still, short
+        time.sleep(1)
+
+
 def recover_missing_chips(
     missing: List[str],
     short_trays: Dict[int, int],
@@ -289,10 +320,13 @@ def recover_missing_chips(
 ) -> Tuple[List[str], Dict[int, int], Optional[str]]:
     """Bring back chips that did not come back from the warm reset.
 
-    Each round re-powers the trays of the missing chips (Galaxy with ``repower`` only;
-    round 1 only those trays, round 2 all four trays of this host), rescans PCI and
+    Each round re-powers only the trays with a missing chip (Galaxy with ``repower`` only;
+    all four trays only for a chip outside the tray map), rescans PCI, sends POST_RESET and
     recounts the missing chips and, after a re-power, every chip of ``known`` (a re-power can
-    knock other trays off PCI too), so those feed the next round.
+    knock other trays off PCI too), so those feed the next round. Each chip is judged by the
+    recount after POST_RESET: a chip on PCI whose config reads back is present, even if its
+    POST_RESET failed (the re-init then checks it); once every chip is present, no further
+    round runs.
     Before each re-power (and before the all-tray fallback) the BMC must answer
     ``ipmitool mc info``; if it does not, or a re-power fails, recovery stops there: no
     further SBR, USER_RESET or re-power. A stop after a round's SBR + USER_RESET still
@@ -307,8 +341,9 @@ def recover_missing_chips(
             {tray_of_bdf(b, wormhole) for b in missing} | set(short_trays), key=str
         )
         if is_galaxy and allow_repower:
-            # A chip on a bus outside the tray map gets all four trays re-powered.
-            repower = list(GALAXY_TRAYS) if round_num > 1 or None in trays else trays
+            # Only trays with a missing chip: a tray whose chips are all present is never
+            # re-powered. A chip on a bus outside the tray map gets all four trays re-powered.
+            repower = list(GALAXY_TRAYS) if None in trays else trays
             # A re-power with no BMC answer can take healthy chips down (OM-F3-GBH01: 24/32
             # to 0/32), so check before every round: no answer, no SBR, USER_RESET or re-power.
             if not _ipmi_answers():
@@ -348,28 +383,14 @@ def recover_missing_chips(
             repower = []
             print(f"Recovery round {round_num}/{RECOVERY_MAX_ROUNDS}: PCI rescan...")
         rescan_pci(missing)
-
-        deadline = time.monotonic() + CHIP_RETURN_TIMEOUT_S
-        while True:
-            present = _present_chips()
-            bdfs = set(present.values())
-            # A tray re-power can knock other trays off PCI as well (OM-E4-GBH02, tt-smi -r with
-            # tray 3 held in reset: tray 3 came back, trays 1, 2 and 4 read all ones), so after a
-            # re-power every known chip is rechecked, not only those on the re-powered trays.
-            check = set(missing) | set(known or [] if repower else [])
-            still = [
-                b
-                for b in check
-                if b not in bdfs or chip_reset_state(b, check_marker=False) != "ok"
-            ]
-            short = (
-                _short_trays(bdfs, wormhole)
-                if is_galaxy and (short_trays or repower)
-                else {}
-            )
-            if (not still and not short) or time.monotonic() >= deadline:
-                break
-            time.sleep(1)
+        present, still, short = _recount(
+            missing,
+            known if repower else None,
+            bool(short_trays or repower),
+            is_galaxy,
+            wormhole,
+            CHIP_RETURN_TIMEOUT_S,
+        )
 
         if repower:
             # After a stop the trays may not have been re-powered: POST_RESET goes to the
@@ -383,22 +404,38 @@ def recover_missing_chips(
                     else tray_of_bdf(bdf, wormhole) in repower
                 )
             ]
-            for interface_id in parallel_reset_device_ioctl(
-                post_ids, IoctlResetFlags.POST_RESET
-            ):
+            post_failed = list(
+                parallel_reset_device_ioctl(post_ids, IoctlResetFlags.POST_RESET)
+            )
+            # Judge every chip again after POST_RESET (OM-E4-GBH02, tray 3 held in reset:
+            # round 1 counted c1-c8:00.0 missing on the check before POST_RESET, so round 2
+            # re-powered all four trays of a box that recounted 32/32 and exited 1).
+            present, still, short = _recount(
+                missing, known, True, is_galaxy, wormhole, POST_RESET_RECHECK_S
+            )
+            for interface_id in post_failed:
+                bdf = present.get(interface_id)
+                back = bdf is not None and bdf not in still
                 print(
                     CMD_LINE_COLOR.RED,
                     f"Error: POST_RESET failed for device /dev/tenstorrent/{interface_id} "
-                    f"({_chip_label(present[interface_id], is_galaxy, wormhole)}).",
+                    f"({_chip_label(bdf, is_galaxy, wormhole) if bdf else 'gone'})."
+                    + (
+                        " The chip reads back on PCI; the re-init checks it."
+                        if back
+                        else ""
+                    ),
                     CMD_LINE_COLOR.ENDC,
                     file=sys.stderr,
                 )
-                still.append(present[interface_id])
+        bdfs = set(present.values())
         missing = sorted(set(still))
         short_trays = short
         if is_galaxy:
+            # Chips on PCI whose config reads back, not only the driver's device count.
+            back = len(bdfs - set(still))
             print(
-                f"Recount after round {round_num}: {len(bdfs)}/{len(GALAXY_TRAYS) * GALAXY_CHIPS_PER_TRAY} chips"
+                f"Recount after round {round_num}: {back}/{len(GALAXY_TRAYS) * GALAXY_CHIPS_PER_TRAY} chips"
             )
         if stopped or (not missing and not short_trays):
             break
