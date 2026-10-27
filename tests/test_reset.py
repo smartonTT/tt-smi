@@ -1209,9 +1209,7 @@ class TestFullRecoveryReset:
         assert code == 1 and not reinit_ran
         assert host.ipmi == [("0xF", GLX_IPMI_OP_MODE_NO_RETIMER)]
         assert len(host.mc_calls) > 3
-        assert (
-            f"in-band IPMI silent for {IPMI_RECOVER_TIMEOUT_S} s" in out.err
-        )
+        assert f"in-band IPMI silent for {IPMI_RECOVER_TIMEOUT_S} s" in out.err
         assert out.err.count("Hardware fault: chip") == 32
         for bdf in GALAXY_BDFS:
             assert f"Hardware fault: chip {bdf} (tray " in out.err
