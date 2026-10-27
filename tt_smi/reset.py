@@ -231,11 +231,14 @@ def rescan_pci(bdfs: List[str]) -> None:
     _sysfs_write(SYSFS_PCI_RESCAN, "1")
 
 
-def _tray_ipmi_reset(trays: List[int]) -> None:
+def _tray_ipmi_reset(trays: List[int], held: Optional[List[str]] = None) -> None:
     """Re-power only ``trays`` through this host's BMC (in-band ipmitool).
 
     UBB n on the BMC is tray n+1, so tray t is bit t-1 of the UBB bitmap.
     If the BMC rejects the per-tray command, reset all four trays (as -glx_reset).
+    ``held``: the chips a hold just took off PCI; the pulse is what releases their tray.
+    If that pulse fails with the BMC silent in-band, wait for it to answer again and
+    release the held tray(s) only (see ``_release_held_trays``).
     """
     bitmap = 0
     for tray in trays:
@@ -254,21 +257,88 @@ def _tray_ipmi_reset(trays: List[int]) -> None:
             return
         print(
             f"{CMD_LINE_COLOR.YELLOW}WARNING!{CMD_LINE_COLOR.ENDC} "
-            f"Per-tray IPMI reset of tray(s) {', '.join(map(str, trays))} failed:\n{failure}\n"
-            f"{CMD_LINE_COLOR.BLUE}Resetting all four trays of this host instead...{CMD_LINE_COLOR.ENDC}"
+            f"Per-tray IPMI reset of tray(s) {', '.join(map(str, trays))} failed:\n{failure}"
         )
         # The per-tray failure may be the BMC going away: check again before the 0xF reset.
         if not _ipmi_answers():
-            raise IpmiNotAnswering(IPMI_SKIPPED)
+            if held is None:
+                raise IpmiNotAnswering(IPMI_SKIPPED)
+            _release_held_trays(trays, held)
+            return
+        print(
+            f"{CMD_LINE_COLOR.BLUE}Resetting all four trays of this host instead...{CMD_LINE_COLOR.ENDC}"
+        )
     run_galaxy_ipmi_reset("0xF", "0xFF", GLX_IPMI_OP_MODE_NO_RETIMER, "0xF")
 
 
-def _tray_ipmi_hold(trays: List[int], bdfs: List[str]) -> None:
+def _wait_ipmi_answers(timeout_s: float) -> bool:
+    """Poll ``ipmitool mc info`` until the BMC answers in-band, for up to ``timeout_s``."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if _ipmi_answers():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(IPMI_RECOVER_POLL_S)
+
+
+def _release_held_trays(trays: List[int], held: List[str]) -> None:
+    """The pulse after a hold failed and the BMC went silent in-band: release the held tray(s).
+
+    OM-E4-GBH02 (task #3981, 1/1): from 31/32 (c1:00.0 off PCI), the hold took tray 3's
+    other 7 chips off PCI, the pulse failed with in-band IPMI silent ("No data available"),
+    and the reset stopped after one 10 s check, leaving tray 3 held: 24/32. Here the reset
+    waits for the BMC to answer again, then lets the tray settle and rescans. If a chip the
+    hold took down reads back, the pulse went through and is not sent again; else the
+    per-tray pulse is sent once more. Never the all-tray fallback: the other trays are up.
+    Raises IpmiNotAnswering if the BMC stays silent, RuntimeError if the second pulse fails.
+    """
+    names = ", ".join(map(str, trays))
+    print(
+        f"In-band IPMI stopped answering after the re-power pulse of tray(s) {names}; "
+        f"waiting up to {IPMI_RECOVER_TIMEOUT_S} s for it to answer again..."
+    )
+    if not _wait_ipmi_answers(IPMI_RECOVER_TIMEOUT_S):
+        raise IpmiNotAnswering(
+            f"in-band IPMI not answering for {IPMI_RECOVER_TIMEOUT_S} s after the "
+            f"re-power pulse of tray(s) {names}; tray re-power skipped"
+        )
+    timed_wait(TRAY_REPOWER_WAIT_S)
+    if held:
+        rescan_pci(held)
+        back = [b for b in held if chip_reset_state(b, check_marker=False) == "ok"]
+        if back:
+            print(
+                f"The BMC answers again; {len(back)} held chip(s) of tray(s) {names} read "
+                "back on PCI, so the pulse went through: not sent again."
+            )
+            return
+    print(
+        f"The BMC answers again; tray(s) {names} still held: sending the pulse once more."
+    )
+    failure = _ipmi_failure_detail(
+        _run_ipmitool(
+            _galaxy_ipmi_cmd(
+                hex(sum(1 << (t - 1) for t in trays)).upper().replace("X", "x"),
+                "0xFF",
+                GLX_IPMI_OP_MODE_NO_RETIMER,
+                "0xF",
+            )
+        )
+    )
+    if failure:
+        raise RuntimeError(
+            f"second re-power pulse of tray(s) {names} failed: {failure}"
+        )
+
+
+def _tray_ipmi_hold(trays: List[int], bdfs: List[str]) -> List[str]:
     """Hold ``trays`` in reset through this host's BMC until ``bdfs`` drop off PCI.
 
     Sends the release (op 0x2), waits TRAY_HOLD_RELEASE_WAIT_S, then the hold (op 0x1).
     The caller's re-power pulse then releases them. Raises RuntimeError if the BMC
     rejects the hold; a hold that leaves chips on PCI only warns (the pulse still runs).
+    Returns the chips of ``bdfs`` the hold took off PCI.
     """
     bitmap = 0
     for tray in trays:
@@ -302,10 +372,16 @@ def _tray_ipmi_hold(trays: List[int], bdfs: List[str]) -> None:
             f"{len(up)} chip(s) still read on PCI {TRAY_HOLD_TIMEOUT_S} s into the hold "
             f"of tray(s) {', '.join(map(str, trays))}: {', '.join(up)}"
         )
+    dropped = [b for b in bdfs if b not in up]
+    return dropped
 
 
 IPMI_CHECK_TIMEOUT_S = 10
 IPMI_SKIPPED = "in-band IPMI not answering; tray re-power skipped"
+# After a failed pulse that should release a held tray: how long to wait for the BMC to
+# answer in-band again, polling ``mc info`` every IPMI_RECOVER_POLL_S.
+IPMI_RECOVER_TIMEOUT_S = 300
+IPMI_RECOVER_POLL_S = 10
 
 
 class IpmiNotAnswering(RuntimeError):
@@ -354,13 +430,14 @@ def _repower_trays(
         )
     if user_reset is not None:
         user_reset.extend(present[i] for i in in_trays)
+    held = None
     if hold:
-        _tray_ipmi_hold(
+        held = _tray_ipmi_hold(
             list(hold),
             [b for b in present.values() if tray_of_bdf(b, wormhole) in hold],
         )
     try:
-        _tray_ipmi_reset(trays)
+        _tray_ipmi_reset(trays, held)
     except RuntimeError as e:
         if hold:
             bitmap = 0
