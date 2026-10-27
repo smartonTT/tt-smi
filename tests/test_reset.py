@@ -1263,8 +1263,8 @@ class TestFullRecoveryReset:
         out = capsys.readouterr()
         assert host.ipmi[0] == ("0x2", GLX_IPMI_OP_MODE_NO_RETIMER)
         assert ("0xF", GLX_IPMI_OP_MODE_NO_RETIMER) in host.ipmi
-        assert f"re-power pulse of {self.ALL_NAME} sent, reply lost" in out.out + out.err
-        assert "pulse of tray(s) 2 sent, reply lost" not in out.out + out.err
+        assert f"re-power pulse of {self.ALL_NAME} (pulse sent, reply lost)" in out.out
+        assert "pulse of tray(s) 2" not in out.out + out.err
 
     def test_held_fallback_pulse_lost_reply_releases_all_four_trays(
         self, tmp_path, capsys
@@ -1273,7 +1273,7 @@ class TestFullRecoveryReset:
         host.kcs_silent_all_only = True
         host.kcs_pulse_acts = True
         host.reject_tray_pulse_after_hold = True
-        host.mc_info = ["ok", "fail", "fail", "ok"]
+        host.mc_info = ["ok", "ok", "fail", "ok"]
         host.reset(ok=False, missing=self.TRAY3)
         out = capsys.readouterr()
         assert ("0xF", GLX_IPMI_OP_MODE_NO_RETIMER) in host.ipmi
