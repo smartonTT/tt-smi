@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from tt_tools_common.ui_common.themes import CMD_LINE_COLOR
 from tt_tools_common.reset_common.wh_reset import WHChipReset
@@ -272,7 +272,25 @@ def _tray_ipmi_reset(trays: List[int], held: Optional[List[str]] = None) -> None
         print(
             f"{CMD_LINE_COLOR.BLUE}Resetting all four trays of this host instead...{CMD_LINE_COLOR.ENDC}"
         )
-    run_galaxy_ipmi_reset("0xF", "0xFF", GLX_IPMI_OP_MODE_NO_RETIMER, "0xF")
+
+    def silent_after_failure() -> bool:
+        # The 0x3 pulse failed and the BMC is silent in-band: pulse sent, reply lost. Wait
+        # for it and let the caller recount; never send the legacy op 0x0 all-tray pulse.
+        if _ipmi_answers():
+            return False
+        if held is None:
+            _wait_after_lost_reply(trays)
+        else:
+            _release_held_trays(trays, held)
+        return True
+
+    run_galaxy_ipmi_reset(
+        "0xF",
+        "0xFF",
+        GLX_IPMI_OP_MODE_NO_RETIMER,
+        "0xF",
+        silent_check=silent_after_failure,
+    )
 
 
 def _wait_ipmi_answers(timeout_s: float) -> bool:
@@ -1026,6 +1044,7 @@ def run_galaxy_ipmi_reset(
     dev_num: str = "0xFF",
     op_mode: str = GLX_IPMI_OP_MODE_NO_RETIMER,
     reset_time: str = "0xF",
+    silent_check: Optional[Callable[[], bool]] = None,
 ) -> None:
     """
     Issue the Galaxy UBB IPMI reset, preferring no-retimer op_mode 0x3.
@@ -1043,6 +1062,15 @@ def run_galaxy_ipmi_reset(
     # Already on the legacy command (or a caller overrode op_mode): do not recurse.
     if op_mode == GLX_IPMI_OP_MODE_WITH_RETIMER:
         raise RuntimeError(f"IPMI command failed: {failure}")
+
+    # ``silent_check`` True: the BMC went silent after the pulse (reply lost); the caller
+    # handled it, so no legacy fallback is sent.
+    if (
+        silent_check is not None
+        and not _ipmi_output_is_param_out_of_range(failure)
+        and silent_check()
+    ):
+        return
 
     if _ipmi_output_is_param_out_of_range(failure):
         print(

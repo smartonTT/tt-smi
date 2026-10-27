@@ -1173,6 +1173,49 @@ class TestFullRecoveryReset:
         assert "Recovery round 2" not in out.out
         assert "UBB" not in out.out + out.err
 
+    # Review #4176 follow-up (mock only): all four trays short, so round 1 sends the 0xF pulse.
+    def _all_trays_short(self, tmp_path, acts):
+        host = FakeGalaxy(
+            tmp_path,
+            states={b: "ones" for b in GALAXY_BDFS},
+            heal={b: "tray" for b in GALAXY_BDFS},
+        )
+        host.kcs_silent_pulses = 1
+        host.kcs_silent_without_hold = True
+        host.kcs_pulse_acts = acts
+        return host
+
+    def test_all_tray_pulse_lost_reply_waits_and_recounts_no_op0_fallback(
+        self, tmp_path, capsys
+    ):
+        host = self._all_trays_short(tmp_path, acts=True)
+        host.mc_info = ["ok", "fail", "fail", "ok"]
+        code, reinit_ran, _ = host.reset(ok=False, missing=list(GALAXY_BDFS))
+        out = capsys.readouterr()
+        assert host.ipmi == [("0xF", GLX_IPMI_OP_MODE_NO_RETIMER)]
+        assert len(host.mc_calls) > 3
+        assert "pulse sent, reply lost" in out.out
+        assert "Recount after round 1: 32/32 chips" in out.out
+        assert code is None and reinit_ran
+        assert all(state == "ok" for state in host.state.values())
+
+    def test_all_tray_pulse_bmc_silent_for_good_names_every_chip_no_op0(
+        self, tmp_path, capsys
+    ):
+        host = self._all_trays_short(tmp_path, acts=False)
+        host.mc_info = ["ok", "fail"]
+        code, reinit_ran, _ = host.reset(ok=False, missing=list(GALAXY_BDFS))
+        out = capsys.readouterr()
+        assert code == 1 and not reinit_ran
+        assert host.ipmi == [("0xF", GLX_IPMI_OP_MODE_NO_RETIMER)]
+        assert len(host.mc_calls) > 3
+        assert (
+            f"in-band IPMI silent for {IPMI_RECOVER_TIMEOUT_S} s" in out.err
+        )
+        assert out.err.count("Hardware fault: chip") == 32
+        for bdf in GALAXY_BDFS:
+            assert f"Hardware fault: chip {bdf} (tray " in out.err
+
     def test_rejected_pulse_bmc_silent_without_hold_waits_no_all_tray_fallback(
         self, tmp_path, capsys
     ):
