@@ -18,6 +18,7 @@ from tt_smi.reset import (
     pci_board_reset,
     glx_6u_trays_reset,
     run_galaxy_ipmi_reset,
+    GLX_IPMI_OP_MODE_HOLD,
     GLX_IPMI_OP_MODE_NO_RETIMER,
     GLX_IPMI_OP_MODE_WITH_RETIMER,
 )
@@ -111,7 +112,9 @@ class FakeGalaxy:
     ``states``: bdf -> ok, marker, ones or gone (default ok). ``heal``: bdf -> how a chip
     that is not ok comes back: "tray" (its tray re-powered), "all" (all four trays
     re-powered), "rescan" (UMD PCI rescan), "sysfs" (sysfs PCI rescan), "post" (POST_RESET
-    sent to it) or "never" (default). ``drop_on_repower``: chips lost
+    sent to it), "hold" (its tray held in reset, then re-powered) or "never" (default).
+    A hold (op 0x1) makes the tray's chips read all ones until its next re-power.
+    ``drop_on_repower``: chips lost
     when their tray is re-powered. ``knock_others``: the first per-tray re-power leaves the
     chips of every other tray reading all ones until their own tray is re-powered.
     ``lose_at_reinit``: chips that read all ones at the first re-init (healed as
@@ -120,6 +123,7 @@ class FakeGalaxy:
     """
 
     lose_at_reinit_heal = "tray"
+    reject_hold = False
 
     def __init__(
         self,
@@ -153,6 +157,7 @@ class FakeGalaxy:
         self.reinit_error = reinit_error
         self.post_reset_fail = set(post_reset_fail)
         self.ipmi = []
+        self.held = {}
         self.ioctls = []
         self.state = {b: "ok" for b in self.bdfs}
         self.state.update(states or {})
@@ -228,6 +233,21 @@ class FakeGalaxy:
             if self.reject_all or (self.reject_per_tray and bitmap != 0xF):
                 return MagicMock(returncode=1, stdout="", stderr=BMC_C9_STDERR)
             trays = {t for t in (1, 2, 3, 4) if bitmap & (1 << (t - 1))}
+            if cmd[7] == GLX_IPMI_OP_MODE_HOLD:
+                if self.reject_hold:
+                    return MagicMock(returncode=1, stdout="", stderr=BMC_C9_STDERR)
+                for bdf in self.bdfs:
+                    if self.tray(bdf) in trays and self.state[bdf] != "gone":
+                        self.held[bdf] = self.state[bdf]
+                        self._set(bdf, "ones")
+                return MagicMock(returncode=0, stdout="", stderr="")
+            # Releasing a held tray: a "hold" chip resets, the others read as before the hold.
+            for bdf in [b for b in self.held if self.tray(b) in trays]:
+                before = self.held.pop(bdf)
+                if self.heal.get(bdf) == "hold":
+                    before = "ok"
+                    self.heal[bdf] = "done"
+                self._set(bdf, before)
             for bdf in self.drop_on_repower:
                 if self.tray(bdf) in trays:
                     self._set(bdf, "gone")
@@ -270,7 +290,13 @@ class FakeGalaxy:
             if self.heal.get(bdf) == "post" and bdf not in self.post_reset_fail:
                 self._set(bdf, "ok")
                 self.heal[bdf] = "done"
-        return [i for i in ids if self.bdfs[i] in self.post_reset_fail]
+        # Like the KMD: POST_RESET fails while the reset marker is still set.
+        return [
+            i
+            for i in ids
+            if self.bdfs[i] in self.post_reset_fail
+            or self.state[self.bdfs[i]] == "marker"
+        ]
 
     def ioctl_ids(self, flag):
         return [ids for f, ids in self.ioctls if f == flag]
@@ -334,15 +360,17 @@ class TestUmdWarmResetResult:
 
     BDFS = ["0000:02:00.0", "0000:03:00.0", "0000:04:00.0"]
 
-    def _reset(self, tmp_path, states, ok, reset_input=None, reinit=True):
-        host = FakeGalaxy(tmp_path, states=states)
+    def _reset(self, tmp_path, states, ok, reset_input=None, reinit=True, heal=None):
+        host = FakeGalaxy(tmp_path, states=states, heal=heal)
         return host.reset(
             ok=ok, reset_input=reset_input, reinit=reinit, with_result=False
         )
 
     def test_failed_reset_names_chips_and_exits_nonzero(self, tmp_path, capsys):
         states = {self.BDFS[0]: "ok", self.BDFS[1]: "marker", self.BDFS[2]: "ones"}
-        code, reinit_ran, _ = self._reset(tmp_path, states, ok=False)
+        code, reinit_ran, _ = self._reset(
+            tmp_path, states, ok=False, heal={self.BDFS[1]: "tray"}
+        )
         err = capsys.readouterr().err
         assert code == 1
         assert not reinit_ran
@@ -355,7 +383,7 @@ class TestUmdWarmResetResult:
             in err
         )
         assert "0000:02:00.0 (tray 1) did not come back" not in err
-        # The tray re-power resets 03:00.0 (its marker is not checked after a re-power); 04:00.0 stays dead.
+        # The tray re-power resets 03:00.0; 04:00.0 stays dead.
         assert (
             "Hardware fault: chip 0000:04:00.0 (tray 1) still missing after tray re-power"
             in err
@@ -693,6 +721,66 @@ class TestFullRecoveryReset:
         assert "Hardware fault" not in out.err
         assert "Recovered: all 8 missing chip(s) are back" in out.out
         assert all(state == "ok" for state in host.state.values())
+
+    def test_live_tray_the_pulse_did_not_reset_is_held_then_repowered(
+        self, tmp_path, capsys
+    ):
+        # OM-E4-GBH02 healthy box (09:43 PDT 10-27): the warm reset left c1-c8:00.0 with the
+        # reset marker set and the round 1 tray 3 pulse did not reset them. POST_RESET failed,
+        # the recount said 32/32 and re-init timed out on their firmware (exit 1). Round 2
+        # now holds tray 3 in reset until its chips drop, then re-powers it.
+        host = FakeGalaxy(
+            tmp_path,
+            states={b: "marker" for b in self.TRAY3},
+            heal={b: "hold" for b in self.TRAY3},
+        )
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
+        assert code is None and reinit_ran
+        assert host.ipmi == [
+            ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
+            ("0x4", GLX_IPMI_OP_MODE_HOLD),
+            ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
+        ]
+        assert (
+            "(0000:c1:00.0 (tray 3)). The chip did not reset (reset marker still set)"
+            in out.err
+        )
+        assert "Recount after round 1: 24/32 chips" in out.out
+        assert "Recount after round 2: 32/32 chips" in out.out
+        assert "Hardware fault" not in out.err
+        assert all(state == "ok" for state in host.state.values())
+
+    def test_live_tray_the_hold_does_not_reset_is_a_hardware_fault(
+        self, tmp_path, capsys
+    ):
+        host = FakeGalaxy(tmp_path, states={b: "marker" for b in self.TRAY3})
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        err = capsys.readouterr().err
+        assert code == 1
+        assert not reinit_ran
+        assert host.ipmi == [
+            ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
+            ("0x4", GLX_IPMI_OP_MODE_HOLD),
+            ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
+        ]
+        assert (
+            "Hardware fault: chip 0000:c1:00.0 (tray 3) still missing after tray re-power "
+            "and PCI rescan: reset marker still set (chip did not reset)" in err
+        )
+
+    def test_rejected_hold_stops_recovery(self, tmp_path, capsys):
+        host = FakeGalaxy(tmp_path, states={b: "marker" for b in self.TRAY3})
+        host.reject_hold = True
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        err = capsys.readouterr().err
+        assert code == 1
+        assert not reinit_ran
+        assert host.ipmi == [
+            ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
+            ("0x4", GLX_IPMI_OP_MODE_HOLD),
+        ]
+        assert "hold of tray(s) 3 failed" in err
 
     def test_tray_that_stays_down_is_the_only_tray_repowered(self, tmp_path, capsys):
         # A whole tray that never comes back: both rounds re-power tray 3 alone (trays 1, 2

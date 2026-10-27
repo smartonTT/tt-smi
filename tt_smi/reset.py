@@ -51,6 +51,8 @@ MINIMUM_DRIVER_VERSION_GALAXY_SECONDARY_BUS_RESET = "2.7.0"
 MINIMUM_BMC_VERSION_NO_RETIMER_RESET = "0.05.22"
 GLX_IPMI_OP_MODE_WITH_RETIMER = "0x0"
 GLX_IPMI_OP_MODE_NO_RETIMER = "0x3"
+# Holds the UBB in reset until the next reset command releases it.
+GLX_IPMI_OP_MODE_HOLD = "0x1"
 
 
 class ResetFailedError(Exception):
@@ -79,6 +81,8 @@ TRAY_REPOWER_WAIT_S = 30
 CHIP_RETURN_TIMEOUT_S = 60
 # Recount after POST_RESET: chips already back read ok at once.
 POST_RESET_RECHECK_S = 10
+# Wait for a held tray's chips to drop off PCI before the release pulse.
+TRAY_HOLD_TIMEOUT_S = 30
 
 
 def chip_reset_state(bdf: str, check_marker: bool = True) -> str:
@@ -231,6 +235,39 @@ def _tray_ipmi_reset(trays: List[int]) -> None:
     run_galaxy_ipmi_reset("0xF", "0xFF", GLX_IPMI_OP_MODE_NO_RETIMER, "0xF")
 
 
+def _tray_ipmi_hold(trays: List[int], bdfs: List[str]) -> None:
+    """Hold ``trays`` in reset through this host's BMC until ``bdfs`` drop off PCI.
+
+    The caller's re-power pulse then releases them. Raises RuntimeError if the BMC
+    rejects the hold; a hold that leaves chips on PCI only warns (the pulse still runs).
+    """
+    bitmap = 0
+    for tray in trays:
+        bitmap |= 1 << (tray - 1)
+    result = _run_ipmitool(
+        _galaxy_ipmi_cmd(
+            hex(bitmap).upper().replace("X", "x"), "0xFF", GLX_IPMI_OP_MODE_HOLD, "0xF"
+        )
+    )
+    failure = _ipmi_failure_detail(result)
+    if failure:
+        raise RuntimeError(
+            f"hold of tray(s) {', '.join(map(str, trays))} failed:\n{failure}"
+        )
+    deadline = time.monotonic() + TRAY_HOLD_TIMEOUT_S
+    while True:
+        up = [b for b in bdfs if chip_reset_state(b, check_marker=False) == "ok"]
+        if not up or time.monotonic() >= deadline:
+            break
+        time.sleep(1)
+    if up:
+        print(
+            f"{CMD_LINE_COLOR.YELLOW}WARNING!{CMD_LINE_COLOR.ENDC} "
+            f"{len(up)} chip(s) still read on PCI {TRAY_HOLD_TIMEOUT_S} s into the hold "
+            f"of tray(s) {', '.join(map(str, trays))}: {', '.join(up)}"
+        )
+
+
 IPMI_CHECK_TIMEOUT_S = 10
 IPMI_SKIPPED = "in-band IPMI not answering; tray re-power skipped"
 
@@ -253,12 +290,16 @@ def _ipmi_answers() -> bool:
 
 
 def _repower_trays(
-    trays: List[int], wormhole: bool, user_reset: Optional[List[str]] = None
+    trays: List[int],
+    wormhole: bool,
+    user_reset: Optional[List[str]] = None,
+    hold: Tuple[int, ...] = (),
 ) -> None:
     """SBR + USER_RESET on the trays' chips, re-power the trays, then wait.
 
-    The BDFs sent USER_RESET are added to ``user_reset`` before the re-power, so a caller
-    whose re-power raises still knows which chips need POST_RESET.
+    Trays in ``hold`` are held in reset until their chips drop off PCI before the re-power
+    pulse. The BDFs sent USER_RESET are added to ``user_reset`` before the re-power, so a
+    caller whose re-power raises still knows which chips need POST_RESET.
     """
     present = _present_chips()
     in_trays = [i for i, bdf in present.items() if tray_of_bdf(bdf, wormhole) in trays]
@@ -277,6 +318,11 @@ def _repower_trays(
         )
     if user_reset is not None:
         user_reset.extend(present[i] for i in in_trays)
+    if hold:
+        _tray_ipmi_hold(
+            list(hold),
+            [b for b in present.values() if tray_of_bdf(b, wormhole) in hold],
+        )
     _tray_ipmi_reset(trays)
     timed_wait(TRAY_REPOWER_WAIT_S)
 
@@ -325,8 +371,9 @@ def recover_missing_chips(
     recounts the missing chips and, after a re-power, every chip of ``known`` (a re-power can
     knock other trays off PCI too), so those feed the next round. Each chip is judged by the
     recount after POST_RESET: a chip on PCI whose config reads back is present, even if its
-    POST_RESET failed (the re-init then checks it); once every chip is present, no further
-    round runs.
+    POST_RESET failed (the re-init then checks it), unless its reset marker is still set: the
+    re-power did not reset it, so it stays missing and the next round holds its tray in reset
+    before the re-power pulse. Once every chip is present, no further round runs.
     Before each re-power (and before the all-tray fallback) the BMC must answer
     ``ipmitool mc info``; if it does not, or a re-power fails, recovery stops there: no
     further SBR, USER_RESET or re-power. A stop after a round's SBR + USER_RESET still
@@ -336,6 +383,7 @@ def recover_missing_chips(
     """
     allow_repower = repower
     stopped = None
+    hold: set = set()
     for round_num in range(1, RECOVERY_MAX_ROUNDS + 1):
         trays = sorted(
             {tray_of_bdf(b, wormhole) for b in missing} | set(short_trays), key=str
@@ -363,7 +411,9 @@ def recover_missing_chips(
             )
             user_reset: List[str] = []
             try:
-                _repower_trays(repower, wormhole, user_reset)
+                _repower_trays(
+                    repower, wormhole, user_reset, tuple(sorted(hold & set(repower)))
+                )
             except RuntimeError as e:
                 # Stop: escalating after a failed re-power can take down healthy trays too.
                 stopped = (
@@ -413,21 +463,29 @@ def recover_missing_chips(
             present, still, short = _recount(
                 missing, known, True, is_galaxy, wormhole, POST_RESET_RECHECK_S
             )
+            hold = set()
             for interface_id in post_failed:
                 bdf = present.get(interface_id)
                 back = bdf is not None and bdf not in still
+                # The KMD fails POST_RESET while the marker is set and then restores nothing,
+                # so here the marker means the chip never reset (OM-E4-GBH02, live tray 3: the
+                # 0x3 pulse left c1-c8:00.0 unreset and re-init timed out on their firmware).
+                if back and chip_reset_state(bdf).startswith("reset marker"):
+                    still = sorted(set(still) | {bdf})
+                    hold.add(tray_of_bdf(bdf, wormhole))
+                    note = " The chip did not reset (reset marker still set); it stays missing."
+                elif back:
+                    note = " The chip reads back on PCI; the re-init checks it."
+                else:
+                    note = ""
                 print(
                     CMD_LINE_COLOR.RED,
                     f"Error: POST_RESET failed for device /dev/tenstorrent/{interface_id} "
-                    f"({_chip_label(bdf, is_galaxy, wormhole) if bdf else 'gone'})."
-                    + (
-                        " The chip reads back on PCI; the re-init checks it."
-                        if back
-                        else ""
-                    ),
+                    f"({_chip_label(bdf, is_galaxy, wormhole) if bdf else 'gone'}).{note}",
                     CMD_LINE_COLOR.ENDC,
                     file=sys.stderr,
                 )
+            hold.discard(None)
         bdfs = set(present.values())
         missing = sorted(set(still))
         short_trays = short
@@ -693,7 +751,7 @@ def _recover_after_failed_reinit() -> bool:
         print(
             CMD_LINE_COLOR.RED,
             f"Chip {_chip_label(bdf, is_galaxy, wormhole)} lost after the recount: "
-            f"{chip_reset_state(bdf, check_marker=False)}",
+            f"{chip_reset_state(bdf)}",
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
         )
@@ -712,7 +770,7 @@ def _recover_after_failed_reinit() -> bool:
         print(
             CMD_LINE_COLOR.RED,
             f"Hardware fault: chip {_chip_label(bdf, is_galaxy, wormhole)} still missing {how}: "
-            f"{chip_reset_state(bdf, check_marker=False)}",
+            f"{chip_reset_state(bdf)}",
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
         )
@@ -861,7 +919,7 @@ def umd_pci_warm_reset(
         print(
             CMD_LINE_COLOR.RED,
             f"Hardware fault: chip {_chip_label(bdf, is_galaxy, wormhole)} still missing {how}: "
-            f"{chip_reset_state(bdf, check_marker=False)}",
+            f"{chip_reset_state(bdf)}",
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
         )
