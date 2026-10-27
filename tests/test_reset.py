@@ -192,6 +192,8 @@ class FakeGalaxy:
     # ``kcs_pulse_acts`` the pulse still re-powers the tray (only the reply was lost).
     kcs_silent_pulses = 0
     kcs_pulse_acts = False
+    # The KCS silence also hits pulses with no hold before them (natural loss, #4132).
+    kcs_silent_without_hold = False
 
     def __init__(
         self,
@@ -357,7 +359,10 @@ class FakeGalaxy:
             if (
                 self.kcs_silent_pulses
                 and cmd[7] == GLX_IPMI_OP_MODE_NO_RETIMER
-                and any(op == GLX_IPMI_OP_MODE_HOLD for _, op in self.ipmi[:-1])
+                and (
+                    self.kcs_silent_without_hold
+                    or any(op == GLX_IPMI_OP_MODE_HOLD for _, op in self.ipmi[:-1])
+                )
             ):
                 self.kcs_silent_pulses -= 1
                 if not self.kcs_pulse_acts:
@@ -738,12 +743,13 @@ class TestFullRecoveryReset:
         host.mc_info = ["ok", "fail"]
         code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
         out = capsys.readouterr()
-        assert host.mc_calls == [10, 10]
+        # Pulse sent, reply lost: waits IPMI_RECOVER_TIMEOUT_S for the BMC, then stops.
+        assert len(host.mc_calls) > 2
         assert host.ipmi == [("0x2", GLX_IPMI_OP_MODE_NO_RETIMER)]  # no 0xF fallback
         self.assert_stopped_after_round_1(host, code, reinit_ran, out)
         assert (
             f"Hardware fault: chip {self.LOST} (tray 2) still missing "
-            "(in-band IPMI not answering; tray re-power skipped)" in out.err
+            "(re-power pulse of tray(s) 2 sent, reply lost" in out.err
         )
 
     def test_failed_round_1_repower_stops_without_escalating(self, tmp_path, capsys):
@@ -1078,19 +1084,113 @@ class TestFullRecoveryReset:
             assert f"Hardware fault: chip {bdf} (tray 3) still missing" in out.err
         assert "Recovery round 2" not in out.out
 
-    def test_kcs_silent_pulse_without_hold_still_stops_at_once(self, tmp_path, capsys):
-        # Mock only. No hold, so no tray is left held: a silent BMC after a plain pulse
-        # stops recovery after the one check, as before (no wait, no second pulse).
+    # Task #4132 (OM-E4-GBH02, natural loss of tray 3, c1-c8:00.0, 0/2): no hold; the pulse
+    # 0x4 0xFF 0x3 0xF got "No data available" and the BMC went silent in-band. ecd5c5e
+    # stopped after one 10 s check ("tray re-power skipped") although the pulse was sent;
+    # fix-d1 ended at 0/32 (trays 1, 2 and 4 all ones), fix-n2 at 24/32.
+    def _natural_tray3(self, tmp_path, acts):
+        host = FakeGalaxy(
+            tmp_path,
+            states={b: "ones" for b in self.TRAY3},
+            heal={b: "tray" for b in self.TRAY3},
+        )
+        host.kcs_silent_pulses = 1
+        host.kcs_silent_without_hold = True
+        host.kcs_pulse_acts = acts
+        return host
+
+    @pytest.mark.parametrize("acts", [True, False])
+    def test_kcs_silent_pulse_without_hold_waits_and_recounts(
+        self, tmp_path, capsys, acts
+    ):
+        # Mock only. The BMC answers again after a few silent polls: the reset recounts every
+        # chip. If the pulse went through, round 1 ends at 32/32; if not, round 2 sends tray 3
+        # its own pulse. Never the all-tray fallback.
+        host = self._natural_tray3(tmp_path, acts)
+        host.mc_info = ["ok", "fail", "fail", "fail", "ok"]
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
+        assert code is None and reinit_ran
+        assert len(host.mc_calls) > 3  # it waited, not one 10 s check
+        assert "pulse sent, reply lost" in out.out
+        assert "Resetting all four trays" not in out.out
+        if acts:
+            assert host.ipmi == [("0x4", GLX_IPMI_OP_MODE_NO_RETIMER)]
+            assert "Recount after round 1: 32/32 chips" in out.out
+            assert "Recovery round 2" not in out.out
+        else:
+            assert host.ipmi == [("0x4", GLX_IPMI_OP_MODE_NO_RETIMER)] * 2
+            assert "Recount after round 1: 24/32 chips" in out.out
+            assert "Recount after round 2: 32/32 chips" in out.out
+        assert "Hardware fault" not in out.err
+        assert all(state == "ok" for state in host.state.values())
+
+    def test_kcs_silent_pulse_that_knocks_other_trays_gets_round_2(
+        self, tmp_path, capsys
+    ):
+        # Mock only. fix-d1's shape: the tray-3 pulse went out, its reply was lost and trays
+        # 1, 2 and 4 read all ones afterwards. Once the BMC answers, the recount finds them
+        # and round 2 re-powers only the trays still short (1, 2, 4; tray 3 is back).
+        host = self._natural_tray3(tmp_path, acts=True)
+        host.knock_others = True
+        host.mc_info = ["ok", "fail", "fail", "ok"]
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
+        assert host.ipmi == [
+            ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
+            ("0xB", GLX_IPMI_OP_MODE_NO_RETIMER),
+        ]
+        assert "Recount after round 1: 8/32 chips" in out.out
+        assert "Recount after round 2: 32/32 chips" in out.out
+        assert code is None and reinit_ran
+        assert all(state == "ok" for state in host.state.values())
+
+    def test_kcs_silent_for_good_without_hold_names_every_chip_and_exits_non_zero(
+        self, tmp_path, capsys
+    ):
+        # Mock only. The BMC never answers in-band again (as in fix-d1, still silent 8 min
+        # later): the reset polls for IPMI_RECOVER_TIMEOUT_S, sends nothing more, rescans,
+        # recounts and names every missing chip by BDF and tray 1-4, rc 1.
+        host = self._natural_tray3(tmp_path, acts=False)
+        host.mc_info = ["ok", "fail"]
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
+        assert code == 1 and not reinit_ran
+        assert host.ipmi == [("0x4", GLX_IPMI_OP_MODE_NO_RETIMER)]
+        assert len(host.mc_calls) > 3
+        reason = (
+            "re-power pulse of tray(s) 3 sent, reply lost; in-band IPMI silent for "
+            f"{IPMI_RECOVER_TIMEOUT_S} s"
+        )
+        assert reason in out.err
+        assert "tray re-power skipped" not in out.err
+        for bdf in self.TRAY3:
+            assert (
+                f"Hardware fault: chip {bdf} (tray 3) still missing ({reason})"
+                in out.err
+            )
+        assert out.err.count("Hardware fault: chip") == 8
+        assert "Recovery round 2" not in out.out
+        assert "UBB" not in out.out + out.err
+
+    def test_rejected_pulse_bmc_silent_without_hold_waits_no_all_tray_fallback(
+        self, tmp_path, capsys
+    ):
+        # Mock only. The per-tray pulse is rejected and the BMC is silent after it: wait, then
+        # recount; no 0xF fallback right after the silent BMC. Round 2 starts with its own
+        # mc info check and per-tray pulse (its usual 0xF fallback once the BMC answers).
         host = FakeGalaxy(
             tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"}
         )
         host.reject_per_tray = True
-        host.mc_info = ["ok", "fail"]
-        code, _, _ = host.reset(ok=False, missing=[self.LOST])
-        capsys.readouterr()
-        assert code == 1
-        assert host.ipmi == [("0x2", GLX_IPMI_OP_MODE_NO_RETIMER)]
-        assert len(host.mc_calls) == 2
+        host.mc_info = ["ok", "fail", "fail", "ok"]
+        host.reset(ok=False, missing=[self.LOST])
+        out = capsys.readouterr()
+        assert host.ipmi[:2] == [("0x2", GLX_IPMI_OP_MODE_NO_RETIMER)] * 2
+        assert len(host.mc_calls) > 3
+        assert "pulse sent, reply lost" in out.out
+        assert "Recount after round 1: 31/32 chips" in out.out
+        assert "Recovery round 2/2: re-powering tray(s) 2" in out.out
 
     def test_hold_leaves_chips_up_pulse_fails_exits_non_zero(self, tmp_path, capsys):
         # The hold timed out with the chips still on PCI and the pulse raised: the recount

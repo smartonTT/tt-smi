@@ -240,7 +240,8 @@ def _tray_ipmi_reset(trays: List[int], held: Optional[List[str]] = None) -> None
     If the BMC rejects the per-tray command, reset all four trays (as -glx_reset).
     ``held``: the chips a hold just took off PCI; the pulse is what releases their tray.
     If that pulse fails with the BMC silent in-band, wait for it to answer again and
-    release the held tray(s) only (see ``_release_held_trays``).
+    release the held tray(s) only (see ``_release_held_trays``); with no hold, wait and
+    let the caller recount (see ``_wait_after_lost_reply``).
     """
     bitmap = 0
     for tray in trays:
@@ -264,7 +265,8 @@ def _tray_ipmi_reset(trays: List[int], held: Optional[List[str]] = None) -> None
         # The per-tray failure may be the BMC going away: check again before the 0xF reset.
         if not _ipmi_answers():
             if held is None:
-                raise IpmiNotAnswering(IPMI_SKIPPED)
+                _wait_after_lost_reply(trays)
+                return
             _release_held_trays(trays, held)
             return
         print(
@@ -284,6 +286,34 @@ def _wait_ipmi_answers(timeout_s: float) -> bool:
         if time.monotonic() >= deadline:
             return False
         time.sleep(IPMI_RECOVER_POLL_S)
+
+
+def _wait_after_lost_reply(trays: List[int]) -> None:
+    """The per-tray pulse (no hold) failed and the BMC went silent in-band: pulse sent, reply lost.
+
+    OM-E4-GBH02 (task #4132 fix-d1 and fix-n2, natural loss of tray 3, 0/2): the pulse
+    ``0x4 0xFF 0x3 0xF`` got "No data available", the reset stopped after one 10 s check and
+    named every chip; in fix-d1 trays 1, 2 and 4 also read all ones afterwards (0/32). Here
+    the reset waits for the BMC to answer again and returns, so the caller rescans and
+    recounts every chip, and a chip still missing gets the next round (with its own mc info
+    check). No second pulse here and never the all-tray fallback after a lost reply.
+    Raises IpmiNotAnswering if the BMC stays silent.
+    """
+    names = ", ".join(map(str, trays))
+    print(
+        f"In-band IPMI stopped answering after the re-power pulse of tray(s) {names} "
+        f"(pulse sent, reply lost); waiting up to {IPMI_RECOVER_TIMEOUT_S} s for it to "
+        "answer again..."
+    )
+    if not _wait_ipmi_answers(IPMI_RECOVER_TIMEOUT_S):
+        raise IpmiNotAnswering(
+            f"re-power pulse of tray(s) {names} sent, reply lost; in-band IPMI silent for "
+            f"{IPMI_RECOVER_TIMEOUT_S} s"
+        )
+    print(
+        f"The BMC answers again; rescanning and recounting every chip after the pulse of "
+        f"tray(s) {names}."
+    )
 
 
 def _release_held_trays(trays: List[int], held: List[str]) -> None:
