@@ -207,7 +207,9 @@ class FakeGalaxy:
             self.mc_calls = getattr(self, "mc_calls", []) + [kwargs.get("timeout")]
             if self.mc_info == "timeout":
                 raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
-            return MagicMock(returncode=0 if self.mc_info == "ok" else 1, stdout="", stderr="")
+            return MagicMock(
+                returncode=0 if self.mc_info == "ok" else 1, stdout="", stderr=""
+            )
         if cmd[:3] == ["sudo", "ipmitool", "raw"]:
             bitmap = int(cmd[5], 16)
             self.ipmi.append((cmd[5], cmd[7]))
@@ -282,27 +284,21 @@ class FakeGalaxy:
             warm.rescan_pci_bdfs.side_effect = self.rescan_pci_bdfs
         clock = MagicMock()
         clock.monotonic.side_effect = itertools.count(0, 10)
-        with patch("tt_smi.reset.SYSFS_PCI_DEVICES", str(self.root)), patch(
-            "tt_smi.reset.SYSFS_PCI_RESCAN", str(self.rescan_file)
-        ), patch(
-            "tt_smi.reset.PCIDevice.enumerate_devices_info",
-            side_effect=self.enumerate_devices_info,
-        ), patch(
-            "tt_smi.reset.WarmReset", warm
-        ), patch(
-            "tt_smi.reset.subprocess.run", side_effect=self.run
-        ), patch(
-            "tt_smi.reset.parallel_reset_device_ioctl", side_effect=self.ioctl
-        ), patch(
-            "tt_smi.reset.timed_wait"
-        ), patch(
-            "tt_smi.reset.time", clock
-        ), patch(
-            "tt_smi.reset.should_use_secondary_bus_reset", return_value=True
-        ), patch(
-            "tt_smi.reset.TopologyDiscovery"
-        ) as topo, patch(
-            "tt_smi.reset.get_default_discovery_options"
+        with (
+            patch("tt_smi.reset.SYSFS_PCI_DEVICES", str(self.root)),
+            patch("tt_smi.reset.SYSFS_PCI_RESCAN", str(self.rescan_file)),
+            patch(
+                "tt_smi.reset.PCIDevice.enumerate_devices_info",
+                side_effect=self.enumerate_devices_info,
+            ),
+            patch("tt_smi.reset.WarmReset", warm),
+            patch("tt_smi.reset.subprocess.run", side_effect=self.run),
+            patch("tt_smi.reset.parallel_reset_device_ioctl", side_effect=self.ioctl),
+            patch("tt_smi.reset.timed_wait"),
+            patch("tt_smi.reset.time", clock),
+            patch("tt_smi.reset.should_use_secondary_bus_reset", return_value=True),
+            patch("tt_smi.reset.TopologyDiscovery") as topo,
+            patch("tt_smi.reset.get_default_discovery_options"),
         ):
             if self.lose_at_reinit or self.reinit_error:
                 topo.discover.side_effect = self.discover
@@ -461,7 +457,9 @@ class TestFullRecoveryReset:
         assert "UBB" not in out.out + out.err
 
     def test_ipmi_answer_allows_repower(self, tmp_path):
-        host = FakeGalaxy(tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"})
+        host = FakeGalaxy(
+            tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"}
+        )
         code, _, _ = host.reset(ok=False, missing=[self.LOST])
         assert code is None
         assert host.mc_calls == [10]
@@ -469,7 +467,9 @@ class TestFullRecoveryReset:
 
     @pytest.mark.parametrize("mode", ["fail", "timeout"])
     def test_no_ipmi_answer_touches_nothing(self, tmp_path, capsys, mode):
-        host = FakeGalaxy(tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"})
+        host = FakeGalaxy(
+            tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"}
+        )
         host.mc_info = mode
         code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
         out = capsys.readouterr()
