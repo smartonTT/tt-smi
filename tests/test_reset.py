@@ -194,6 +194,9 @@ class FakeGalaxy:
     kcs_pulse_acts = False
     # The KCS silence also hits pulses with no hold before them (natural loss, #4132).
     kcs_silent_without_hold = False
+    # Only the 0xF all-tray pulse loses its reply; per-tray pulses answer (review #4185).
+    kcs_silent_all_only = False
+    reject_tray_pulse_after_hold = False
 
     def __init__(
         self,
@@ -359,6 +362,7 @@ class FakeGalaxy:
             if (
                 self.kcs_silent_pulses
                 and cmd[7] == GLX_IPMI_OP_MODE_NO_RETIMER
+                and (bitmap == 0xF or not self.kcs_silent_all_only)
                 and (
                     self.kcs_silent_without_hold
                     or any(op == GLX_IPMI_OP_MODE_HOLD for _, op in self.ipmi[:-1])
@@ -368,6 +372,13 @@ class FakeGalaxy:
                 if not self.kcs_pulse_acts:
                     return MagicMock(returncode=1, stdout="", stderr=KCS_SILENT_STDERR)
                 silent = True
+            if (
+                self.reject_tray_pulse_after_hold
+                and cmd[7] == GLX_IPMI_OP_MODE_NO_RETIMER
+                and bitmap != 0xF
+                and any(op == GLX_IPMI_OP_MODE_HOLD for _, op in self.ipmi[:-1])
+            ):
+                return MagicMock(returncode=1, stdout="", stderr=BMC_C9_STDERR)
             if self.reject_pulse_after_hold and cmd[7] != GLX_IPMI_OP_MODE_HOLD:
                 if any(op == GLX_IPMI_OP_MODE_HOLD for _, op in self.ipmi[:-1]):
                     return MagicMock(returncode=1, stdout="", stderr=BMC_C9_STDERR)
@@ -1232,6 +1243,54 @@ class TestFullRecoveryReset:
         assert "pulse sent, reply lost" in out.out
         assert "Recount after round 1: 31/32 chips" in out.out
         assert "Recovery round 2/2: re-powering tray(s) 2" in out.out
+
+    # Review #4185 follow-ups (mock only): the 0xF fallback after a rejected per-tray pulse.
+    ALL_NAME = "all four trays (0xF all-tray pulse)"
+
+    def test_fallback_pulse_lost_reply_names_the_all_tray_pulse(
+        self, tmp_path, capsys
+    ):
+        host = FakeGalaxy(
+            tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"}
+        )
+        host.reject_per_tray = True
+        host.kcs_silent_pulses = 1
+        host.kcs_silent_without_hold = True
+        host.kcs_silent_all_only = True
+        host.kcs_pulse_acts = True
+        host.mc_info = ["ok", "ok", "fail", "ok"]
+        host.reset(ok=False, missing=[self.LOST])
+        out = capsys.readouterr()
+        assert host.ipmi[0] == ("0x2", GLX_IPMI_OP_MODE_NO_RETIMER)
+        assert ("0xF", GLX_IPMI_OP_MODE_NO_RETIMER) in host.ipmi
+        assert f"re-power pulse of {self.ALL_NAME} sent, reply lost" in out.out + out.err
+        assert "pulse of tray(s) 2 sent, reply lost" not in out.out + out.err
+
+    def test_held_fallback_pulse_lost_reply_releases_all_four_trays(
+        self, tmp_path, capsys
+    ):
+        host, _ = self._e3963(tmp_path)
+        host.kcs_silent_all_only = True
+        host.kcs_pulse_acts = True
+        host.reject_tray_pulse_after_hold = True
+        host.mc_info = ["ok", "fail", "fail", "ok"]
+        host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
+        assert ("0xF", GLX_IPMI_OP_MODE_NO_RETIMER) in host.ipmi
+        text = out.out + out.err
+        assert self.ALL_NAME in text
+        assert "tray(s) 3 sent, reply lost" not in text
+        assert "tray(s) 3 still held" not in text
+
+    def test_fallback_pulse_post_resets_every_tray_it_repowered(self, tmp_path):
+        host = FakeGalaxy(
+            tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"}
+        )
+        host.reject_per_tray = True
+        host.reset(ok=False, missing=[self.LOST])
+        assert ("0xF", GLX_IPMI_OP_MODE_NO_RETIMER) in host.ipmi
+        post = {i for ids in host.ioctl_ids(IoctlResetFlags.POST_RESET) for i in ids}
+        assert post == set(range(32))
 
     def test_hold_leaves_chips_up_pulse_fails_exits_non_zero(self, tmp_path, capsys):
         # The hold timed out with the chips still on PCI and the pulse raised: the recount

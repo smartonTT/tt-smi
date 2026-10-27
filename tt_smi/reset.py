@@ -233,7 +233,16 @@ def rescan_pci(bdfs: List[str]) -> None:
     _sysfs_write(SYSFS_PCI_RESCAN, "1")
 
 
-def _tray_ipmi_reset(trays: List[int], held: Optional[List[str]] = None) -> None:
+def _pulse_names(trays: List[int]) -> str:
+    """How a lost-reply message names the pulse: all four trays is the 0xF all-tray pulse."""
+    if sorted(trays) == list(GALAXY_TRAYS):
+        return "all four trays (0xF all-tray pulse)"
+    return f"tray(s) {', '.join(map(str, trays))}"
+
+
+def _tray_ipmi_reset(
+    trays: List[int], held: Optional[List[str]] = None
+) -> List[int]:
     """Re-power only ``trays`` through this host's BMC (in-band ipmitool).
 
     UBB n on the BMC is tray n+1, so tray t is bit t-1 of the UBB bitmap.
@@ -242,6 +251,8 @@ def _tray_ipmi_reset(trays: List[int], held: Optional[List[str]] = None) -> None
     If that pulse fails with the BMC silent in-band, wait for it to answer again and
     release the held tray(s) only (see ``_release_held_trays``); with no hold, wait and
     let the caller recount (see ``_wait_after_lost_reply``).
+    Returns the trays the pulse that went out covers: ``trays``, or all four after the
+    0xF fallback (the caller gives those the same POST_RESET).
     """
     bitmap = 0
     for tray in trays:
@@ -257,7 +268,7 @@ def _tray_ipmi_reset(trays: List[int], held: Optional[List[str]] = None) -> None
         )
         failure = _ipmi_failure_detail(result)
         if not failure:
-            return
+            return list(trays)
         print(
             f"{CMD_LINE_COLOR.YELLOW}WARNING!{CMD_LINE_COLOR.ENDC} "
             f"Per-tray IPMI reset of tray(s) {', '.join(map(str, trays))} failed:\n{failure}"
@@ -266,9 +277,9 @@ def _tray_ipmi_reset(trays: List[int], held: Optional[List[str]] = None) -> None
         if not _ipmi_answers():
             if held is None:
                 _wait_after_lost_reply(trays)
-                return
+                return list(trays)
             _release_held_trays(trays, held)
-            return
+            return list(trays)
         print(
             f"{CMD_LINE_COLOR.BLUE}Resetting all four trays of this host instead...{CMD_LINE_COLOR.ENDC}"
         )
@@ -278,10 +289,11 @@ def _tray_ipmi_reset(trays: List[int], held: Optional[List[str]] = None) -> None
         # for it and let the caller recount; never send the legacy op 0x0 all-tray pulse.
         if _ipmi_answers():
             return False
+        # The pulse that went out is the all-tray 0xF one, whatever ``trays`` was.
         if held is None:
-            _wait_after_lost_reply(trays)
+            _wait_after_lost_reply(list(GALAXY_TRAYS))
         else:
-            _release_held_trays(trays, held)
+            _release_held_trays(list(GALAXY_TRAYS), held)
         return True
 
     run_galaxy_ipmi_reset(
@@ -291,6 +303,7 @@ def _tray_ipmi_reset(trays: List[int], held: Optional[List[str]] = None) -> None
         "0xF",
         silent_check=silent_after_failure,
     )
+    return list(GALAXY_TRAYS)
 
 
 def _wait_ipmi_answers(timeout_s: float) -> bool:
@@ -317,20 +330,20 @@ def _wait_after_lost_reply(trays: List[int]) -> None:
     check). No second pulse here and never the all-tray fallback after a lost reply.
     Raises IpmiNotAnswering if the BMC stays silent.
     """
-    names = ", ".join(map(str, trays))
+    names = _pulse_names(trays)
     print(
-        f"In-band IPMI stopped answering after the re-power pulse of tray(s) {names} "
+        f"In-band IPMI stopped answering after the re-power pulse of {names} "
         f"(pulse sent, reply lost); waiting up to {IPMI_RECOVER_TIMEOUT_S} s for it to "
         "answer again..."
     )
     if not _wait_ipmi_answers(IPMI_RECOVER_TIMEOUT_S):
         raise IpmiNotAnswering(
-            f"re-power pulse of tray(s) {names} sent, reply lost; in-band IPMI silent for "
+            f"re-power pulse of {names} sent, reply lost; in-band IPMI silent for "
             f"{IPMI_RECOVER_TIMEOUT_S} s"
         )
     print(
         f"The BMC answers again; rescanning and recounting every chip after the pulse of "
-        f"tray(s) {names}."
+        f"{names}."
     )
 
 
@@ -345,15 +358,15 @@ def _release_held_trays(trays: List[int], held: List[str]) -> None:
     per-tray pulse is sent once more. Never the all-tray fallback: the other trays are up.
     Raises IpmiNotAnswering if the BMC stays silent, RuntimeError if the second pulse fails.
     """
-    names = ", ".join(map(str, trays))
+    names = _pulse_names(trays)
     print(
-        f"In-band IPMI stopped answering after the re-power pulse of tray(s) {names}; "
+        f"In-band IPMI stopped answering after the re-power pulse of {names}; "
         f"waiting up to {IPMI_RECOVER_TIMEOUT_S} s for it to answer again..."
     )
     if not _wait_ipmi_answers(IPMI_RECOVER_TIMEOUT_S):
         raise IpmiNotAnswering(
             f"release pulse sent, reply lost; in-band IPMI silent for "
-            f"{IPMI_RECOVER_TIMEOUT_S} s; tray(s) {names} may still be held"
+            f"{IPMI_RECOVER_TIMEOUT_S} s; {names} may still be held"
         )
     timed_wait(TRAY_REPOWER_WAIT_S)
     if held:
@@ -367,12 +380,12 @@ def _release_held_trays(trays: List[int], held: List[str]) -> None:
             time.sleep(POST_RESET_POLL_S)
         if back:
             print(
-                f"The BMC answers again; {len(back)} held chip(s) of tray(s) {names} read "
+                f"The BMC answers again; {len(back)} held chip(s) of {names} read "
                 "back on PCI, so the pulse went through: not sent again."
             )
             return
     print(
-        f"The BMC answers again; tray(s) {names} still held: sending the pulse once more."
+        f"The BMC answers again; {names} still held: sending the pulse once more."
     )
     failure = _ipmi_failure_detail(
         _run_ipmitool(
@@ -386,7 +399,7 @@ def _release_held_trays(trays: List[int], held: List[str]) -> None:
     )
     if failure:
         raise RuntimeError(
-            f"second re-power pulse of tray(s) {names} failed: {failure}"
+            f"second re-power pulse of {names} failed: {failure}"
         )
 
 
@@ -496,7 +509,7 @@ def _repower_trays(
             [b for b in present.values() if tray_of_bdf(b, wormhole) in hold],
         )
     try:
-        _tray_ipmi_reset(trays, held)
+        pulsed = _tray_ipmi_reset(trays, held)
     except RuntimeError as e:
         if hold:
             bitmap = 0
@@ -520,6 +533,7 @@ def _repower_trays(
             raise TrayHeldError(str(e)) from e
         raise
     timed_wait(TRAY_REPOWER_WAIT_S)
+    return pulsed
 
 
 def _recount(
@@ -615,12 +629,16 @@ def recover_missing_chips(
                 CMD_LINE_COLOR.ENDC,
             )
             user_reset: List[str] = []
+            repowered_now = set(repower)
             try:
-                _repower_trays(
+                pulsed = _repower_trays(
                     repower, wormhole, user_reset, tuple(sorted(hold & set(repower)))
                 )
+                # The 0xF fallback re-powers all four trays, not only ``repower``: those
+                # chips need the same POST_RESET (goal 17: all 32 chips back).
+                repowered_now = set(pulsed or repower)
                 if repowered is not None:
-                    repowered.update(repower)
+                    repowered.update(repowered_now)
             except RuntimeError as e:
                 if isinstance(e, TrayHeldError):
                     # The recount may find these chips, but the tray may still be held: the
@@ -666,7 +684,7 @@ def recover_missing_chips(
                 if (
                     bdf in user_reset
                     if stopped
-                    else tray_of_bdf(bdf, wormhole) in repower
+                    else tray_of_bdf(bdf, wormhole) in repowered_now
                 )
             ]
             post_failed = list(
@@ -1051,8 +1069,11 @@ def run_galaxy_ipmi_reset(
 
     BMC firmware v0.05.22 or later accepts 0x3. Older BMCs reject it with
     IPMI completion code 0xc9 (Parameter out of range) and do not reset.
-    On any 0x3 failure, print a warning and fall back to legacy op_mode 0x0
-    so the tray reset still goes through.
+    On a 0x3 failure, print a warning and fall back to legacy op_mode 0x0
+    so the tray reset still goes through, except when ``silent_check`` is set and
+    returns True: the BMC went silent after the pulse (reply lost), the caller waits
+    and recounts, and no op 0x0 pulse is sent. A parameter-out-of-range failure
+    (old BMC) still falls back.
     """
     result = _run_ipmitool(_galaxy_ipmi_cmd(ubb_num, dev_num, op_mode, reset_time))
     failure = _ipmi_failure_detail(result)
