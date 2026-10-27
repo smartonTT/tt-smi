@@ -151,8 +151,12 @@ class FakeGalaxy:
         lose_at_reinit=(),
         reinit_error=False,
         post_reset_fail=(),
+        bar_ones=None,
     ):
         self.released = set()
+        # bdf -> "tray", "all" or "never": tt-umd discovery reads 0xffffffff from the chip (its config
+        # space reads fine) until its tray, or all four trays, are re-powered (task #3973).
+        self.bar_ones = dict(bar_ones or {})
         self.events = []
         self.root = tmp_path / "devices"
         self.root.mkdir()
@@ -286,6 +290,11 @@ class FakeGalaxy:
                         self._set(bdf, "ones")
                         self.heal[bdf] = "tray"
             self._heal(("all",) if bitmap == 0xF else ())
+            for bdf, mode in list(self.bar_ones.items()):
+                if mode == "never":
+                    continue
+                if bitmap == 0xF or (mode == "tray" and self.tray(bdf) in trays):
+                    del self.bar_ones[bdf]
             for bdf, mode in self.heal.items():
                 if mode == "tray" and self.tray(bdf) in trays:
                     self._set(bdf, "ok")
@@ -306,6 +315,10 @@ class FakeGalaxy:
         bad = [b for b in self.bdfs if self.state[b] != "ok"]
         if self.reinit_error:
             raise RuntimeError("Ethernet training timed out")
+        for bdf in self.bar_ones:
+            raise RuntimeError(
+                f"Read 0xffffffff over PCIe ID {self.bdfs.index(bdf)}: the board should be reset"
+            )
         if bad:
             raise RuntimeError(f"Read 0xffffffff from PCIE: {bad[0]}")
 
@@ -385,7 +398,7 @@ class FakeGalaxy:
             )
             topo = stack.enter_context(patch("tt_smi.reset.TopologyDiscovery"))
             stack.enter_context(patch("tt_smi.reset.get_default_discovery_options"))
-            if self.lose_at_reinit or self.reinit_error:
+            if self.lose_at_reinit or self.reinit_error or self.bar_ones:
                 topo.discover.side_effect = self.discover
             try:
                 pci_board_reset(reset_input, reinit=reinit, use_umd=True)
@@ -1037,6 +1050,42 @@ class TestFullRecoveryReset:
         assert f"Chip {lost} (tray 1) lost after the recount" in out.err
         assert "re-initializing again" in out.out
         assert host.ipmi == [("0x1", GLX_IPMI_OP_MODE_NO_RETIMER)]  # tray 1 only
+
+    def test_umd_ffff_chip_gets_tray_then_all_tray_repower(self, tmp_path, capsys):
+        # Mock only. OM-F3-GBH02 47:00.0 (tray 2), task #3973, 08:05-08:10 PDT 10-27: back on
+        # PCI after a tray 2 re-power, but tt-umd discovery read 0xffffffff from it; only the
+        # all-tray re-power (glx_reset) gave 32/32. Config space alone must not count it back.
+        chip = "0000:47:00.0"
+        host = FakeGalaxy(tmp_path, bar_ones={chip: "all"})
+        code, _, _ = host.reset(ok=True)
+        out = capsys.readouterr()
+        assert code is None
+        assert host.discovers == 3
+        assert host.ipmi == [
+            ("0x2", GLX_IPMI_OP_MODE_NO_RETIMER),
+            ("0xF", GLX_IPMI_OP_MODE_NO_RETIMER),
+        ]
+        assert (
+            f"Chip {chip} (tray 2) lost after the recount: tt-umd discovery read "
+            "0xffffffff (config space reads fine)" in out.err
+        )
+
+    def test_umd_ffff_chip_healed_by_its_tray_needs_no_all_tray(self, tmp_path):
+        chip = "0000:47:00.0"
+        host = FakeGalaxy(tmp_path, bar_ones={chip: "tray"})
+        code, _, _ = host.reset(ok=True)
+        assert code is None
+        assert host.discovers == 2
+        assert host.ipmi == [("0x2", GLX_IPMI_OP_MODE_NO_RETIMER)]
+
+    def test_umd_ffff_chip_that_never_heals_exits_1(self, tmp_path, capsys):
+        chip = "0000:47:00.0"
+        host = FakeGalaxy(tmp_path, bar_ones={chip: "never"})
+        code, _, _ = host.reset(ok=True)
+        assert code == 1
+        assert host.discovers == 3
+        assert [b for b, _ in host.ipmi] == ["0x2", "0xF"]
+        assert "Error when re-initializing chips after recovery" in capsys.readouterr().out
 
     def test_reinit_failure_with_no_lost_chip_exits_without_repower(self, tmp_path):
         host = FakeGalaxy(tmp_path, reinit_error=True)

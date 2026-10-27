@@ -9,6 +9,7 @@ Device-selection parsing for ``-r`` / ``--reset`` lives in
 """
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -800,9 +801,19 @@ def _target_bdfs(reset_input: SmiDeviceInput, chips) -> List[str]:
     return [info.pci_bdf for info in chips.values()]
 
 
-def _recover_after_failed_reinit() -> bool:
+def _umd_unreadable_ids(err: Exception) -> List[int]:
+    """Chip ids tt-umd discovery read 0xffffffff from ("Read 0xffffffff over PCIe ID 8")."""
+    return sorted({int(i) for i in re.findall(r"0xffffffff over PCIe ID (\d+)", str(err))})
+
+
+def _recover_after_failed_reinit(err: Exception, all_trays: bool = False) -> bool:
     """Recount every chip after a failed re-init; re-power and rescan the lost ones.
 
+    A chip is lost if its config space does not read back, or if the re-init error says
+    tt-umd read 0xffffffff from it: OM-F3-GBH02 47:00.0 (task #3973) was back on PCI with
+    its config reading fine after a tray re-power, but discovery still read 0xffffffff and
+    only an all-tray re-power brought it back. ``all_trays`` re-powers all four trays (as
+    -glx_reset) instead of only the lost chips' trays.
     Returns True once all chips read back again (re-init may be retried), False if
     no chip reads as lost (the re-init failure has another cause) or chips stay lost.
     """
@@ -812,18 +823,33 @@ def _recover_after_failed_reinit() -> bool:
     )
     wormhole = any(info.device_id == WORMHOLE_DEVICE_ID for info in chips.values())
     bdfs = sorted({info.pci_bdf for info in chips.values()})
-    lost = [b for b in bdfs if chip_reset_state(b, check_marker=False) != "ok"]
+    unreadable = {chips[i].pci_bdf for i in _umd_unreadable_ids(err) if i in chips}
+    lost = [
+        b
+        for b in bdfs
+        if b in unreadable or chip_reset_state(b, check_marker=False) != "ok"
+    ]
     short_trays = _short_trays(bdfs, wormhole) if is_galaxy else {}
     if not lost and not short_trays:
         return False
     for bdf in lost:
+        state = chip_reset_state(bdf)
+        if bdf in unreadable and state == "ok":
+            state = "tt-umd discovery read 0xffffffff (config space reads fine)"
         print(
             CMD_LINE_COLOR.RED,
             f"Chip {_chip_label(bdf, is_galaxy, wormhole)} lost after the recount: "
-            f"{chip_reset_state(bdf)}",
+            f"{state}",
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
         )
+    if all_trays and is_galaxy:
+        # Every tray counts as short, so recovery re-powers all four (task #3973: only the
+        # whole-box re-power gave 32/32 after the tray re-power left 0xffffffff reads).
+        short_trays = {tray: 0 for tray in GALAXY_TRAYS}
+        for bdf in bdfs:
+            if tray_of_bdf(bdf, wormhole) in short_trays:
+                short_trays[tray_of_bdf(bdf, wormhole)] += 1
     still, still_short, stopped = recover_missing_chips(
         lost, short_trays, is_galaxy, wormhole, known=bdfs, repower=True
     )
@@ -1137,22 +1163,28 @@ def pci_board_reset(
                 f"Error when re-initializing chips!\n {e}",
                 CMD_LINE_COLOR.ENDC,
             )
-            # A chip lost after the recount (it reads all ones at re-init) gets the
-            # recovery rounds once more, then one more re-init, before giving up.
-            if not (
-                use_umd
-                and reset_input.type == SmiDeviceTargetKind.ALL
-                and _recover_after_failed_reinit()
-            ):
-                sys.exit(1)
-            try:
-                reinit_chips()
-            except Exception as e2:
-                print(
-                    CMD_LINE_COLOR.RED,
-                    f"Error when re-initializing chips after recovery!\n {e2}",
-                    CMD_LINE_COLOR.ENDC,
-                )
+            # A chip lost after the recount (it reads all ones, or tt-umd reads 0xffffffff
+            # from it, at re-init) gets the recovery rounds once more and one more re-init;
+            # if that fails too, all four trays are re-powered and re-init runs a last time.
+            err = e
+            for all_trays in (False, True):
+                if not (
+                    use_umd
+                    and reset_input.type == SmiDeviceTargetKind.ALL
+                    and _recover_after_failed_reinit(err, all_trays)
+                ):
+                    sys.exit(1)
+                try:
+                    reinit_chips()
+                    break
+                except Exception as e2:
+                    print(
+                        CMD_LINE_COLOR.RED,
+                        f"Error when re-initializing chips after recovery!\n {e2}",
+                        CMD_LINE_COLOR.ENDC,
+                    )
+                    err = e2
+            else:
                 sys.exit(1)
 
 
