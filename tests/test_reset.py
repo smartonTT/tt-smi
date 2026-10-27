@@ -1247,9 +1247,7 @@ class TestFullRecoveryReset:
     # Review #4185 follow-ups (mock only): the 0xF fallback after a rejected per-tray pulse.
     ALL_NAME = "all four trays (0xF all-tray pulse)"
 
-    def test_fallback_pulse_lost_reply_names_the_all_tray_pulse(
-        self, tmp_path, capsys
-    ):
+    def test_fallback_pulse_lost_reply_names_the_all_tray_pulse(self, tmp_path, capsys):
         host = FakeGalaxy(
             tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"}
         )

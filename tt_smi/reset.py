@@ -240,9 +240,7 @@ def _pulse_names(trays: List[int]) -> str:
     return f"tray(s) {', '.join(map(str, trays))}"
 
 
-def _tray_ipmi_reset(
-    trays: List[int], held: Optional[List[str]] = None
-) -> List[int]:
+def _tray_ipmi_reset(trays: List[int], held: Optional[List[str]] = None) -> List[int]:
     """Re-power only ``trays`` through this host's BMC (in-band ipmitool).
 
     UBB n on the BMC is tray n+1, so tray t is bit t-1 of the UBB bitmap.
@@ -384,9 +382,7 @@ def _release_held_trays(trays: List[int], held: List[str]) -> None:
                 "back on PCI, so the pulse went through: not sent again."
             )
             return
-    print(
-        f"The BMC answers again; {names} still held: sending the pulse once more."
-    )
+    print(f"The BMC answers again; {names} still held: sending the pulse once more.")
     failure = _ipmi_failure_detail(
         _run_ipmitool(
             _galaxy_ipmi_cmd(
@@ -398,9 +394,7 @@ def _release_held_trays(trays: List[int], held: List[str]) -> None:
         )
     )
     if failure:
-        raise RuntimeError(
-            f"second re-power pulse of {names} failed: {failure}"
-        )
+        raise RuntimeError(f"second re-power pulse of {names} failed: {failure}")
 
 
 def _tray_ipmi_hold(trays: List[int], bdfs: List[str]) -> List[str]:
