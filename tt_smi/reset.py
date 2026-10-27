@@ -226,6 +226,22 @@ def _tray_ipmi_reset(trays: List[int]) -> None:
     run_galaxy_ipmi_reset("0xF", "0xFF", GLX_IPMI_OP_MODE_NO_RETIMER, "0xF")
 
 
+IPMI_CHECK_TIMEOUT_S = 10
+
+
+def _ipmi_answers() -> bool:
+    """True if this host's BMC answers in-band (``ipmitool mc info``, 10 s limit)."""
+    cmd = ["sudo", "ipmitool", "mc", "info"]
+    print(f"Executing command: {' '.join(cmd)}")
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=IPMI_CHECK_TIMEOUT_S
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def _repower_trays(trays: List[int], wormhole: bool) -> None:
     """SBR + USER_RESET on the trays' chips, re-power the trays, wait, then rescan."""
     in_trays = [
@@ -265,6 +281,17 @@ def recover_missing_chips(
     Returns the chips (by BDF) and short trays (tray -> chips present) still missing afterwards.
     """
     allow_repower = repower
+    if is_galaxy and allow_repower and not _ipmi_answers():
+        # A re-power with no BMC answer can take healthy chips down (OM-F3-GBH01: 24/32 to 0/32),
+        # so touch nothing: no SBR, USER_RESET or re-power.
+        print(
+            CMD_LINE_COLOR.RED,
+            "In-band IPMI (ipmitool mc info) did not answer within "
+            f"{IPMI_CHECK_TIMEOUT_S} s: no tray re-power, no SBR or USER_RESET on any chip.",
+            CMD_LINE_COLOR.ENDC,
+            file=sys.stderr,
+        )
+        return sorted(missing), short_trays
     for round_num in range(1, RECOVERY_MAX_ROUNDS + 1):
         trays = sorted(
             {tray_of_bdf(b, wormhole) for b in missing} | set(short_trays), key=str

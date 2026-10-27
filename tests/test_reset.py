@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import itertools
+import subprocess
 import pytest
 
 from typing import List, Tuple
@@ -199,7 +200,14 @@ class FakeGalaxy:
             for b in bdfs
         }
 
+    mc_info = "ok"  # "ok", "fail" or "timeout"
+
     def run(self, cmd, **kwargs):
+        if cmd[:4] == ["sudo", "ipmitool", "mc", "info"]:
+            self.mc_calls = getattr(self, "mc_calls", []) + [kwargs.get("timeout")]
+            if self.mc_info == "timeout":
+                raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+            return MagicMock(returncode=0 if self.mc_info == "ok" else 1, stdout="", stderr="")
         if cmd[:3] == ["sudo", "ipmitool", "raw"]:
             bitmap = int(cmd[5], 16)
             self.ipmi.append((cmd[5], cmd[7]))
@@ -450,6 +458,26 @@ class TestFullRecoveryReset:
         assert f"Chip {self.LOST} (tray 2) did not come back from reset" in out.err
         assert "Recount after round 1: 32/32 chips" in out.out
         assert "Recovered" in out.out
+        assert "UBB" not in out.out + out.err
+
+    def test_ipmi_answer_allows_repower(self, tmp_path):
+        host = FakeGalaxy(tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"})
+        code, _, _ = host.reset(ok=False, missing=[self.LOST])
+        assert code is None
+        assert host.mc_calls == [10]
+        assert host.ipmi == [("0x2", GLX_IPMI_OP_MODE_NO_RETIMER)]
+
+    @pytest.mark.parametrize("mode", ["fail", "timeout"])
+    def test_no_ipmi_answer_touches_nothing(self, tmp_path, capsys, mode):
+        host = FakeGalaxy(tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"})
+        host.mc_info = mode
+        code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
+        out = capsys.readouterr()
+        assert code == 1 and not reinit_ran
+        assert host.ipmi == []
+        assert host.ioctl_ids(IoctlResetFlags.RESET_PCIE_LINK) == []
+        assert host.ioctl_ids(IoctlResetFlags.USER_RESET) == []
+        assert f"Hardware fault: chip {self.LOST} (tray 2)" in out.err
         assert "UBB" not in out.out + out.err
 
     def test_umd_missing_list_alone_triggers_recovery(self, tmp_path, capsys):
