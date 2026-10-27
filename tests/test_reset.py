@@ -3,7 +3,9 @@
 
 import contextlib
 import itertools
+import json
 import subprocess
+import sys
 import pytest
 
 from typing import List, Tuple
@@ -109,6 +111,37 @@ GALAXY_BDFS = [
 ]
 
 
+def _link(a, ca, b, cb):
+    return tuple(sorted(((a, ca), (b, cb))))
+
+
+def _bdf(base, n):
+    return f"0000:{base + n:02x}:00.0"
+
+
+# A fake in-box mesh (89 links): chips chained in each tray on ch 4/5 -> 2/3, tray 1 <-> 2 and
+# tray 3 <-> 4 chip by chip on ch 6/7 -> 0/1, one link tray 2 <-> 3.
+GALAXY_LINKS = (
+    {
+        _link(_bdf(base, n), 4 + k, _bdf(base, n + 1), 2 + k)
+        for base in (0x00, 0x40, 0xC0, 0x80)
+        for n in range(1, 8)
+        for k in (0, 1)
+    }
+    | {
+        _link(_bdf(a, n), 6 + k, _bdf(b, n), k)
+        for a, b in ((0x00, 0x40), (0xC0, 0x80))
+        for n in range(1, 9)
+        for k in (0, 1)
+    }
+    | {_link(_bdf(0x40, 8), 6, _bdf(0xC0, 8), 6)}
+)
+# OM-F3-GBH02, task #4008: tray 2 re-powered alone left 05-45, 06-46, 07-47 ch 6/7 down.
+F3_GBH02_LINKS_DOWN = {
+    _link(_bdf(0x00, n), 6 + k, _bdf(0x40, n), k) for n in (5, 6, 7) for k in (0, 1)
+}
+
+
 class FakeGalaxy:
     """A host's chips for ``tt-smi -r`` unit tests: fake sysfs, enumeration, IPMI and rescan.
 
@@ -127,6 +160,11 @@ class FakeGalaxy:
     ``lose_at_reinit``: chips that read all ones at the first re-init (healed as
     ``lose_at_reinit_heal`` says, default their tray re-powered); with it, re-init fails while
     any chip is not ok. ``post_reset_fail``: chips whose POST_RESET ioctl fails.
+    ``eth_drop``: the ``eth_fragile`` in-box links go down when a re-power pulse covers the
+    tray of one end only, and come back when a pulse covers both ends' trays ("both"), only on
+    an all-tray pulse ("all") or never ("never"). ``eth_unreadable``: the link read (tt-umd
+    discovery in a child process) fails "before" the reset only, "after" the first read, or
+    "always". ``link_reads`` counts the reads.
     """
 
     lose_at_reinit_heal = "tray"
@@ -152,8 +190,17 @@ class FakeGalaxy:
         reinit_error=False,
         post_reset_fail=(),
         bar_ones=None,
+        eth_drop=None,
+        eth_fragile=F3_GBH02_LINKS_DOWN,
+        eth_unreadable=None,
     ):
         self.released = set()
+        self.eth_links = set(GALAXY_LINKS)
+        self.eth_down = set()
+        self.eth_drop = eth_drop
+        self.eth_fragile = set(eth_fragile)
+        self.eth_unreadable = eth_unreadable
+        self.link_reads = 0
         # bdf -> "tray", "all" or "never": tt-umd discovery reads 0xffffffff from the chip (its config
         # space reads fine) until its tray, or all four trays, are re-powered (task #3973).
         self.bar_ones = dict(bar_ones or {})
@@ -233,7 +280,39 @@ class FakeGalaxy:
     # "ok", "fail" or "timeout"; a list gives one answer per call, its last one repeating.
     mc_info = "ok"
 
+    def read_links(self):
+        self.link_reads += 1
+        fail = {"before": self.link_reads == 1, "after": self.link_reads > 1}.get(
+            self.eth_unreadable, self.eth_unreadable == "always"
+        )
+        if fail:
+            return MagicMock(returncode=1, stdout="", stderr="discovery failed")
+        ends = [
+            [a, ca, b, cb]
+            for (a, ca), (b, cb) in sorted(self.eth_links - self.eth_down)
+            # The first read is before the reset, when every chip was still up.
+            if self.link_reads == 1 or self.state[a] == self.state[b] == "ok"
+        ]
+        return MagicMock(
+            returncode=0, stdout="LINKS " + json.dumps(ends) + "\n", stderr=""
+        )
+
+    def _pulse_links(self, trays, bitmap):
+        if not self.eth_drop:
+            return
+        for link in self.eth_links:
+            ends = {self.tray(b) for b, _ in link}
+            if link in self.eth_down and ends <= trays:
+                if self.eth_drop == "both" or (
+                    self.eth_drop == "all" and bitmap == 0xF
+                ):
+                    self.eth_down.discard(link)
+            elif link in self.eth_fragile and len(ends & trays) == 1:
+                self.eth_down.add(link)
+
     def run(self, cmd, **kwargs):
+        if cmd[:2] == [sys.executable, "-c"]:
+            return self.read_links()
         if cmd[:4] == ["sudo", "ipmitool", "mc", "info"]:
             self.mc_calls = getattr(self, "mc_calls", []) + [kwargs.get("timeout")]
             answer = self.mc_info
@@ -273,6 +352,7 @@ class FakeGalaxy:
                         self.held[bdf] = self.state[bdf]
                         self._set(bdf, "ones")
                 return MagicMock(returncode=0, stdout="", stderr="")
+            self._pulse_links(trays, bitmap)
             # Releasing a held tray: a "hold" chip resets, the others read as before the hold.
             for bdf in [b for b in self.held if self.tray(b) in trays]:
                 before = self.held.pop(bdf)
@@ -1304,6 +1384,162 @@ class TestFullRecoveryReset:
             f"Hardware fault: chip {self.LOST} (tray 2) still missing"
             in capsys.readouterr().err
         )
+
+
+class TestInboxLinksAfterRepower:
+    """After a tray re-power, ``tt-smi -r`` checks the in-box ETH links and re-powers to bring
+    them back (mock only; OM-F3-GBH02 47:00.0, task #4008: tray 2 re-powered alone left
+    05-45, 06-46, 07-47 ch 6/7 down, 114/120 links, until a glx_reset)."""
+
+    LOST = "0000:47:00.0"  # tray 2
+    NR = GLX_IPMI_OP_MODE_NO_RETIMER
+
+    def _host(self, tmp_path, **kwargs):
+        return FakeGalaxy(
+            tmp_path, states={self.LOST: "gone"}, heal={self.LOST: "tray"}, **kwargs
+        )
+
+    def test_links_down_after_tray_repower_get_both_sides_repowered(
+        self, tmp_path, capsys
+    ):
+        host = self._host(tmp_path, eth_drop="both")
+        code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
+        out = capsys.readouterr()
+        assert code is None and reinit_ran
+        # Tray 2, then trays 1 and 2 (both sides of 05-45, 06-46, 07-47); no all-tray re-power.
+        assert host.ipmi == [("0x2", self.NR), ("0x3", self.NR)]
+        assert "In-box ETH links before the reset: 89" in out.out
+        assert "In-box ETH links after re-powering tray(s) 2: 83/89" in out.out
+        assert "(both sides of each down link)" in out.out
+        assert "In-box ETH links after re-powering tray(s) 1, 2: 89/89" in out.out
+        assert "In-box ETH links back: 89/89" in out.out
+
+    def test_links_only_all_trays_bring_back_get_all_tray_repower(
+        self, tmp_path, capsys
+    ):
+        host = self._host(tmp_path, eth_drop="all")
+        code, _, _ = host.reset(ok=False, missing=[self.LOST])
+        out = capsys.readouterr()
+        assert code is None
+        assert host.ipmi == [("0x2", self.NR), ("0x3", self.NR), ("0xF", self.NR)]
+        assert "In-box ETH links after re-powering tray(s) 1, 2: 83/89" in out.out
+        assert "In-box ETH links after re-powering tray(s) 1, 2, 3, 4: 89/89" in out.out
+
+    def test_links_that_stay_down_exit_nonzero_naming_chip_tray_and_link(
+        self, tmp_path, capsys
+    ):
+        host = self._host(tmp_path, eth_drop="never")
+        code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
+        out = capsys.readouterr()
+        assert code == 1 and not reinit_ran
+        assert host.ipmi == [("0x2", self.NR), ("0x3", self.NR), ("0xF", self.NR)]
+        assert (
+            "Fault: chip 0000:05:00.0 (tray 1) in-box ETH link(s) down after the all-tray "
+            "re-power: ch 6 -> 0000:45:00.0 (tray 2) ch 0; ch 7 -> 0000:45:00.0 (tray 2) ch 1"
+            in out.err
+        )
+        assert "Fault: chip 0000:47:00.0 (tray 2) in-box ETH link(s) down" in out.err
+        assert "0000:04:00.0" not in out.err
+        assert "6 chip(s) did not come back" in out.err
+
+    def test_healthy_reset_reads_links_once_and_repowers_nothing(self, tmp_path):
+        host = FakeGalaxy(tmp_path, eth_drop="never")
+        code, _, _ = host.reset(ok=True)
+        assert code is None
+        assert host.link_reads == 1 and host.ipmi == []
+
+    def test_links_intact_after_tray_repower_need_no_more_repower(
+        self, tmp_path, capsys
+    ):
+        host = self._host(tmp_path)
+        code, _, _ = host.reset(ok=False, missing=[self.LOST])
+        assert code is None
+        assert host.ipmi == [("0x2", self.NR)]
+        assert (
+            "In-box ETH links after re-powering tray(s) 2: 89/89"
+            in capsys.readouterr().out
+        )
+
+    def test_no_link_set_before_uses_expected_count_and_all_trays(
+        self, tmp_path, capsys
+    ):
+        host = self._host(tmp_path, eth_drop="all", eth_unreadable="before")
+        with patch("tt_smi.reset.EXPECTED_BH_GALAXY_INBOX_LINKS", len(GALAXY_LINKS)):
+            code, _, _ = host.reset(ok=False, missing=[self.LOST])
+        out = capsys.readouterr()
+        assert code is None
+        # The down links cannot be named: straight to the all-tray re-power.
+        assert host.ipmi == [("0x2", self.NR), ("0xF", self.NR)]
+        assert "In-box ETH links before the reset: unreadable" in out.out
+        assert "In-box ETH links after re-powering tray(s) 2: 83/89" in out.out
+
+    def test_no_link_set_before_links_short_after_all_trays_exits_1(
+        self, tmp_path, capsys
+    ):
+        host = self._host(tmp_path, eth_drop="never", eth_unreadable="before")
+        with patch("tt_smi.reset.EXPECTED_BH_GALAXY_INBOX_LINKS", len(GALAXY_LINKS)):
+            code, _, _ = host.reset(ok=False, missing=[self.LOST])
+        assert code == 1
+        assert "6 in-box ETH link(s) down after the all-tray re-power (83/89)" in (
+            capsys.readouterr().err
+        )
+
+    def test_links_unreadable_after_repower_escalate_then_fail(self, tmp_path, capsys):
+        host = self._host(tmp_path, eth_unreadable="after")
+        code, _, _ = host.reset(ok=False, missing=[self.LOST])
+        out = capsys.readouterr()
+        assert code == 1
+        assert host.ipmi == [("0x2", self.NR), ("0xF", self.NR)]
+        assert "In-box ETH links after re-powering tray(s) 2: unreadable" in out.out
+        assert (
+            "could not be read after the all-tray re-power (89 read before" in out.err
+        )
+
+    def test_links_never_readable_are_not_judged(self, tmp_path, capsys):
+        host = self._host(tmp_path, eth_unreadable="always")
+        code, _, _ = host.reset(ok=False, missing=[self.LOST])
+        assert code is None
+        assert host.ipmi == [("0x2", self.NR)]
+        assert "in-box ETH links not checked" in capsys.readouterr().err
+
+    def test_bmc_gone_before_link_repower_exits_1(self, tmp_path, capsys):
+        host = self._host(tmp_path, eth_drop="both")
+        host.mc_info = ["ok", "fail"]
+        code, _, _ = host.reset(ok=False, missing=[self.LOST])
+        out = capsys.readouterr()
+        assert code == 1
+        assert host.ipmi == [("0x2", self.NR)]
+        assert "In-box ETH links not recovered" in out.err
+
+    def test_reinit_recovery_also_checks_links(self, tmp_path, capsys):
+        # The 0xffffffff re-init path (task #3973) re-powers tray 2 alone too.
+        host = FakeGalaxy(tmp_path, bar_ones={self.LOST: "tray"}, eth_drop="both")
+        code, _, _ = host.reset(ok=True)
+        assert code is None
+        assert host.discovers == 2
+        assert host.ipmi == [("0x2", self.NR), ("0x3", self.NR)]
+
+    def test_reinit_recovery_links_stay_down_exits_1(self, tmp_path, capsys):
+        host = FakeGalaxy(tmp_path, bar_ones={self.LOST: "tray"}, eth_drop="never")
+        code, _, _ = host.reset(ok=True)
+        assert code == 1
+        assert [b for b, _ in host.ipmi] == ["0x2", "0x3", "0xF"]
+        assert "in-box ETH link(s) down after the all-tray re-power" in (
+            capsys.readouterr().err
+        )
+
+    @pytest.mark.parametrize(
+        "kind,value",
+        [
+            (SmiDeviceTargetKind.PCI_BDF, ["0000:47:00.0"]),
+            (SmiDeviceTargetKind.DEV_TENSTORRENT_ID, [14]),
+        ],
+    )
+    def test_targeted_reset_reads_no_links(self, tmp_path, kind, value):
+        host = self._host(tmp_path, eth_drop="never")
+        host.heal[self.LOST] = "rescan"
+        host.reset(ok=False, reset_input=SmiDeviceInput(kind, value))
+        assert host.link_reads == 0 and host.ipmi == []
 
 
 class TestParseResetInput:

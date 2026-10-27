@@ -8,13 +8,14 @@ Device-selection parsing for ``-r`` / ``--reset`` lives in
 :mod:`tt_smi.device_input`; this module focuses on the reset mechanism itself.
 """
 
+import json
 import os
 import re
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from tt_tools_common.ui_common.themes import CMD_LINE_COLOR
 from tt_tools_common.reset_common.wh_reset import WHChipReset
@@ -413,6 +414,7 @@ def recover_missing_chips(
     wormhole: bool,
     known: Optional[List[str]] = None,
     repower: bool = True,
+    repowered: Optional[set] = None,
 ) -> Tuple[List[str], Dict[int, int], Optional[str]]:
     """Bring back chips that did not come back from the warm reset.
 
@@ -429,7 +431,8 @@ def recover_missing_chips(
     further SBR, USER_RESET or re-power. A stop after a round's SBR + USER_RESET still
     rescans PCI, sends POST_RESET to the chips that got USER_RESET and recounts every chip.
     Returns the chips (by BDF) and short trays (tray -> chips present) still missing afterwards,
-    and why recovery stopped early (None if it did not).
+    and why recovery stopped early (None if it did not). Trays whose re-power pulse went through
+    are added to ``repowered``.
     """
     allow_repower = repower
     stopped = None
@@ -472,6 +475,8 @@ def recover_missing_chips(
                 _repower_trays(
                     repower, wormhole, user_reset, tuple(sorted(hold & set(repower)))
                 )
+                if repowered is not None:
+                    repowered.update(repower)
             except RuntimeError as e:
                 if isinstance(e, TrayHeldError):
                     # The recount may find these chips, but the tray may still be held: the
@@ -568,6 +573,227 @@ def recover_missing_chips(
             break
     missing = sorted(set(missing) | held_unverified)
     return missing, short_trays, stopped if (missing or short_trays) else None
+
+
+# In-box ETH links of a Blackhole Galaxy as tt-umd discovery reads them (OM-F3-GBH02, task
+# #4008: 240 directed link ends, 120 links). Used only when no link set was read before the reset.
+EXPECTED_BH_GALAXY_INBOX_LINKS = 120
+LINK_READ_TIMEOUT_S = 120
+LINK_TRAIN_WAIT_S = 30
+LINK_POLL_S = 5
+
+# Same discovery call that counted the links on hardware (task #4008); a child process, so a
+# hung chip cannot stall the reset and tt-smi keeps no device open across it.
+_LINK_READ_SCRIPT = r"""
+import json
+import tt_umd
+cd = tt_umd.TopologyDiscovery.create_cluster_descriptor()
+bdf = {int(k): v for k, v in cd.get_chip_pci_bdfs().items()}
+ends = []
+for chip, chans in cd.get_ethernet_connections().items():
+    for chan, (rchip, rchan) in chans.items():
+        if int(chip) in bdf and int(rchip) in bdf:
+            ends.append([bdf[int(chip)], int(chan), bdf[int(rchip)], int(rchan)])
+print("LINKS " + json.dumps(ends))
+"""
+
+Link = Tuple[Tuple[str, int], Tuple[str, int]]
+
+
+def read_inbox_links() -> Optional[Set[Link]]:
+    """In-box ETH links (both ends on this host's PCI), each as ((bdf, chan), (bdf, chan)).
+
+    Returns None if tt-umd discovery fails or does not finish within LINK_READ_TIMEOUT_S.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _LINK_READ_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=LINK_READ_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        if line.startswith("LINKS "):
+            try:
+                return {
+                    tuple(
+                        sorted(((str(a).lower(), int(ca)), (str(b).lower(), int(cb))))
+                    )
+                    for a, ca, b, cb in json.loads(line[len("LINKS ") :])
+                }
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
+def _links_short(
+    before: Optional[Set[Link]], now: Set[Link], wormhole: bool
+) -> Tuple[Set[Link], int]:
+    """Links of ``before`` missing from ``now`` and how many are short.
+
+    With no ``before``, a Blackhole Galaxy is compared with its expected link count (the down
+    links cannot be named then); a Wormhole Galaxy is not judged.
+    """
+    if before is not None:
+        down = before - now
+        return down, len(down)
+    if wormhole:
+        return set(), 0
+    return set(), max(0, EXPECTED_BH_GALAXY_INBOX_LINKS - len(now))
+
+
+def _wait_links(
+    before: Optional[Set[Link]], wormhole: bool
+) -> Tuple[Optional[Set[Link]], Set[Link], int]:
+    """Read the links until none is short or LINK_TRAIN_WAIT_S passed (links retrain)."""
+    deadline = time.monotonic() + LINK_TRAIN_WAIT_S
+    while True:
+        now = read_inbox_links()
+        down, short = (
+            _links_short(before, now, wormhole) if now is not None else (set(), 0)
+        )
+        if (now is not None and not short) or time.monotonic() >= deadline:
+            return now, down, short
+        time.sleep(LINK_POLL_S)
+
+
+def check_inbox_links_after_repower(
+    before: Optional[Set[Link]],
+    repowered: set,
+    is_galaxy: bool,
+    wormhole: bool,
+) -> None:
+    """After a tray re-power, check every chip's in-box ETH links; re-power to bring them back.
+
+    A tray re-powered alone can leave its links to the other trays down (OM-F3-GBH02 47:00.0,
+    task #4008: tray 2 re-powered alone, 32/32 on PCI but 05-45, 06-46, 07-47 ch 6/7 down,
+    114/120 links, until a glx_reset). Links are compared with ``before`` (read before the
+    reset) or, without it, with the board's expected count. Down links get the trays on both
+    sides of each one re-powered, then, if still down, all four trays. Raises ResetFailedError
+    naming each chip (BDF, tray) and its down links if they stay down.
+    """
+    if not is_galaxy or not repowered:
+        return
+    ref = (
+        len(before)
+        if before is not None
+        else (None if wormhole else EXPECTED_BH_GALAXY_INBOX_LINKS)
+    )
+    now, down, short = _wait_links(before, wormhole)
+    if now is None and before is None:
+        print(
+            CMD_LINE_COLOR.YELLOW,
+            "Warning: in-box ETH links not checked after the tray re-power: tt-umd discovery "
+            "could not read them, before or after the reset.",
+            CMD_LINE_COLOR.ENDC,
+            file=sys.stderr,
+        )
+        return
+    if ref is None:
+        print(f"In-box ETH links after the tray re-power: {len(now)} (not judged)")
+        return
+
+    def counted(label: str) -> None:
+        got = "unreadable" if now is None else f"{len(now)}/{ref}"
+        print(f"In-box ETH links {label}: {got}")
+
+    counted("after re-powering tray(s) " + ", ".join(map(str, sorted(repowered))))
+    if now is not None and not short:
+        return
+    steps = []
+    both = sorted({tray_of_bdf(b, wormhole) for link in down for b, _ in link} - {None})
+    if both and set(both) | set(repowered) != set(GALAXY_TRAYS):
+        steps.append((both, "both sides of each down link"))
+    steps.append((list(GALAXY_TRAYS), "all trays"))
+    for trays, why in steps:
+        print(
+            CMD_LINE_COLOR.PURPLE,
+            f"In-box ETH links down: re-powering tray(s) {', '.join(map(str, trays))} ({why})...",
+            CMD_LINE_COLOR.ENDC,
+        )
+        bdfs = sorted(_present_chips().values())
+        still, still_short, stopped = recover_missing_chips(
+            [], {t: 0 for t in trays}, True, wormhole, known=bdfs, repowered=repowered
+        )
+        if stopped:
+            # A stop before any recount returns the trays as passed in: count them now.
+            still_short = _short_trays(_present_chips().values(), wormhole)
+        if still or still_short or stopped:
+            how = f"({stopped})" if stopped else "after the link re-power"
+            for bdf in still:
+                print(
+                    CMD_LINE_COLOR.RED,
+                    f"Hardware fault: chip {_chip_label(bdf, True, wormhole)} missing {how}: "
+                    f"{fault_state(bdf)}",
+                    CMD_LINE_COLOR.ENDC,
+                    file=sys.stderr,
+                )
+            for tray, count in sorted(still_short.items()):
+                print(
+                    CMD_LINE_COLOR.RED,
+                    f"Hardware fault: tray {tray} has {count}/{GALAXY_CHIPS_PER_TRAY} chips {how}",
+                    CMD_LINE_COLOR.ENDC,
+                    file=sys.stderr,
+                )
+            if stopped and not still and not still_short:
+                print(
+                    CMD_LINE_COLOR.RED,
+                    f"In-box ETH links not recovered: re-power stopped {how}.",
+                    CMD_LINE_COLOR.ENDC,
+                    file=sys.stderr,
+                )
+            raise ResetFailedError(
+                still + [f"tray {t}" for t in sorted(still_short)]
+                or [f"in-box ETH links (tray(s) {', '.join(map(str, trays))})"]
+            )
+        now, down, short = _wait_links(before, wormhole)
+        counted(f"after re-powering tray(s) {', '.join(map(str, trays))}")
+        if now is not None and not short:
+            print(
+                CMD_LINE_COLOR.GREEN,
+                f"In-box ETH links back: {len(now)}/{ref}.",
+                CMD_LINE_COLOR.ENDC,
+            )
+            return
+    if now is None:
+        print(
+            CMD_LINE_COLOR.RED,
+            "Fault: in-box ETH links could not be read after the all-tray re-power "
+            f"({len(before)} read before the reset).",
+            CMD_LINE_COLOR.ENDC,
+            file=sys.stderr,
+        )
+        raise ResetFailedError(["in-box ETH links unreadable"])
+    if not down:
+        print(
+            CMD_LINE_COLOR.RED,
+            f"Fault: {short} in-box ETH link(s) down after the all-tray re-power "
+            f"({len(now)}/{ref}); no link set was read before the reset, so they cannot be named.",
+            CMD_LINE_COLOR.ENDC,
+            file=sys.stderr,
+        )
+        raise ResetFailedError([f"{short} in-box ETH link(s)"])
+    per_chip: Dict[str, List[str]] = {}
+    for (a, ca), (b, cb) in sorted(down):
+        per_chip.setdefault(a, []).append(
+            f"ch {ca} -> {_chip_label(b, True, wormhole)} ch {cb}"
+        )
+        per_chip.setdefault(b, []).append(
+            f"ch {cb} -> {_chip_label(a, True, wormhole)} ch {ca}"
+        )
+    for bdf, ends in sorted(per_chip.items()):
+        print(
+            CMD_LINE_COLOR.RED,
+            f"Fault: chip {_chip_label(bdf, True, wormhole)} in-box ETH link(s) down after the "
+            f"all-tray re-power: {'; '.join(ends)}",
+            CMD_LINE_COLOR.ENDC,
+            file=sys.stderr,
+        )
+    raise ResetFailedError([_chip_label(b, True, wormhole) for b in sorted(per_chip)])
 
 
 def _ipmi_output_is_param_out_of_range(output: str) -> bool:
@@ -808,15 +1034,20 @@ def _umd_unreadable_ids(err: Exception) -> List[int]:
     )
 
 
-def _recover_after_failed_reinit(err: Exception, all_trays: bool = False) -> bool:
+def _recover_after_failed_reinit(
+    err: Exception,
+    all_trays: bool = False,
+    links_before: Optional[Set[Link]] = None,
+) -> bool:
     """Recount every chip after a failed re-init; re-power and rescan the lost ones.
 
     A chip is lost if its config space does not read back, or if the re-init error says
     tt-umd read 0xffffffff from it: OM-F3-GBH02 47:00.0 (task #3973) was back on PCI with
     its config reading fine after a tray re-power, but discovery still read 0xffffffff and
     only an all-tray re-power brought it back. ``all_trays`` re-powers all four trays (as
-    -glx_reset) instead of only the lost chips' trays.
-    Returns True once all chips read back again (re-init may be retried), False if
+    -glx_reset) instead of only the lost chips' trays. After the re-power the in-box ETH links
+    are checked against ``links_before`` (check_inbox_links_after_repower).
+    Returns True once all chips (and links) read back again (re-init may be retried), False if
     no chip reads as lost (the re-init failure has another cause) or chips stay lost.
     """
     chips = PCIDevice.enumerate_devices_info()
@@ -852,10 +1083,24 @@ def _recover_after_failed_reinit(err: Exception, all_trays: bool = False) -> boo
         for bdf in bdfs:
             if tray_of_bdf(bdf, wormhole) in short_trays:
                 short_trays[tray_of_bdf(bdf, wormhole)] += 1
+    repowered: set = set()
     still, still_short, stopped = recover_missing_chips(
-        lost, short_trays, is_galaxy, wormhole, known=bdfs, repower=True
+        lost,
+        short_trays,
+        is_galaxy,
+        wormhole,
+        known=bdfs,
+        repower=True,
+        repowered=repowered,
     )
     if not still and not still_short:
+        try:
+            check_inbox_links_after_repower(
+                links_before, repowered, is_galaxy, wormhole
+            )
+        except ResetFailedError as e:
+            print(CMD_LINE_COLOR.RED, e, CMD_LINE_COLOR.ENDC, file=sys.stderr)
+            return False
         print(
             CMD_LINE_COLOR.GREEN,
             f"Recovered: all {len(lost)} lost chip(s) are back; re-initializing again.",
@@ -883,9 +1128,11 @@ def _recover_after_failed_reinit(err: Exception, all_trays: bool = False) -> boo
 
 def umd_pci_warm_reset(
     reset_input: SmiDeviceInput,
-):
+) -> Optional[Set[Link]]:
     """
     Reset the PCI devices using UMD warm reset.
+
+    Returns the in-box ETH links read before a full Galaxy reset (None if not read).
     """
     chips = PCIDevice.enumerate_devices_info()
     # check if any of the chips are galaxy
@@ -901,6 +1148,14 @@ def umd_pci_warm_reset(
             CMD_LINE_COLOR.ENDC,
         )
     secondary_bus_reset = should_use_secondary_bus_reset(is_galaxy)
+    # Only a full reset re-powers trays: read the in-box ETH links to check them against after.
+    links_before = None
+    if is_galaxy and reset_input.type == SmiDeviceTargetKind.ALL:
+        links_before = read_inbox_links()
+        print(
+            "In-box ETH links before the reset: "
+            + (str(len(links_before)) if links_before is not None else "unreadable")
+        )
 
     # UMD with warm_reset_with_result names the chips that did not come back.
     with_result = getattr(WarmReset, "warm_reset_with_result", None)
@@ -965,7 +1220,7 @@ def umd_pci_warm_reset(
     # A Galaxy has 8 chips on each of its 4 trays; a tray short before the reset is missing chips too.
     short_trays = _short_trays(bdfs, wormhole) if is_galaxy and full else {}
     if ok and not failed and not short_trays:
-        return
+        return links_before
     for bdf in failed:
         print(
             CMD_LINE_COLOR.RED,
@@ -990,10 +1245,18 @@ def umd_pci_warm_reset(
         raise ResetFailedError(failed)
 
     # Only a full reset re-powers trays: a targeted reset rescans PCI at most.
+    repowered: set = set()
     still, still_short, stopped = recover_missing_chips(
-        failed, short_trays, is_galaxy, wormhole, known=bdfs, repower=full
+        failed,
+        short_trays,
+        is_galaxy,
+        wormhole,
+        known=bdfs,
+        repower=full,
+        repowered=repowered,
     )
     if not still and not still_short:
+        check_inbox_links_after_repower(links_before, repowered, is_galaxy, wormhole)
         print(
             CMD_LINE_COLOR.GREEN,
             f"Recovered: all {len(failed)} missing chip(s) are back"
@@ -1005,7 +1268,7 @@ def umd_pci_warm_reset(
             + ".",
             CMD_LINE_COLOR.ENDC,
         )
-        return
+        return links_before
     how = (
         f"({stopped})"
         if stopped
@@ -1128,9 +1391,10 @@ def pci_board_reset(
 ):
     """Given a ``SmiDeviceInput`` ``reset_input``, reset the PCI devices using UMD warm reset or luwen (pyluwen)."""
 
+    links_before = None
     if use_umd:
         try:
-            umd_pci_warm_reset(reset_input)
+            links_before = umd_pci_warm_reset(reset_input)
         except ResetFailedError as e:
             print(CMD_LINE_COLOR.RED, e, CMD_LINE_COLOR.ENDC, file=sys.stderr)
             sys.exit(1)
@@ -1173,7 +1437,7 @@ def pci_board_reset(
                 if not (
                     use_umd
                     and reset_input.type == SmiDeviceTargetKind.ALL
-                    and _recover_after_failed_reinit(err, all_trays)
+                    and _recover_after_failed_reinit(err, all_trays, links_before)
                 ):
                     sys.exit(1)
                 try:
