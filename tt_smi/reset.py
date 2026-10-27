@@ -97,6 +97,8 @@ CHIP_RETURN_TIMEOUT_S = 60
 POST_RESET_RECHECK_S = 10
 # Wait for a held tray's chips to drop off PCI before the release pulse.
 TRAY_HOLD_TIMEOUT_S = 30
+# Poll interval while waiting for held chips to read back.
+POST_RESET_POLL_S = 2
 
 
 def chip_reset_state(bdf: str, check_marker: bool = True) -> str:
@@ -274,9 +276,11 @@ def _tray_ipmi_reset(trays: List[int], held: Optional[List[str]] = None) -> None
 def _wait_ipmi_answers(timeout_s: float) -> bool:
     """Poll ``ipmitool mc info`` until the BMC answers in-band, for up to ``timeout_s``."""
     deadline = time.monotonic() + timeout_s
+    first = True
     while True:
-        if _ipmi_answers():
+        if _ipmi_answers(announce=first):
             return True
+        first = False
         if time.monotonic() >= deadline:
             return False
         time.sleep(IPMI_RECOVER_POLL_S)
@@ -300,13 +304,19 @@ def _release_held_trays(trays: List[int], held: List[str]) -> None:
     )
     if not _wait_ipmi_answers(IPMI_RECOVER_TIMEOUT_S):
         raise IpmiNotAnswering(
-            f"in-band IPMI not answering for {IPMI_RECOVER_TIMEOUT_S} s after the "
-            f"re-power pulse of tray(s) {names}; tray re-power skipped"
+            f"release pulse sent, reply lost; in-band IPMI silent for "
+            f"{IPMI_RECOVER_TIMEOUT_S} s; tray(s) {names} may still be held"
         )
     timed_wait(TRAY_REPOWER_WAIT_S)
     if held:
         rescan_pci(held)
-        back = [b for b in held if chip_reset_state(b, check_marker=False) == "ok"]
+        back = []
+        deadline = time.monotonic() + CHIP_RETURN_TIMEOUT_S
+        while True:
+            back = [b for b in held if chip_reset_state(b, check_marker=False) == "ok"]
+            if back or time.monotonic() >= deadline:
+                break
+            time.sleep(POST_RESET_POLL_S)
         if back:
             print(
                 f"The BMC answers again; {len(back)} held chip(s) of tray(s) {names} read "
@@ -388,10 +398,11 @@ class IpmiNotAnswering(RuntimeError):
     """The BMC did not answer ``ipmitool mc info`` before a re-power step."""
 
 
-def _ipmi_answers() -> bool:
+def _ipmi_answers(announce: bool = True) -> bool:
     """True if this host's BMC answers in-band (``ipmitool mc info``, 10 s limit)."""
     cmd = ["sudo", "ipmitool", "mc", "info"]
-    print(f"Executing command: {' '.join(cmd)}")
+    if announce:
+        print(f"Executing command: {' '.join(cmd)}")
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=IPMI_CHECK_TIMEOUT_S

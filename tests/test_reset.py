@@ -1012,6 +1012,44 @@ class TestFullRecoveryReset:
         assert out.err.count("Hardware fault: chip") == 1
         assert f"Hardware fault: chip {lost} (tray 3) still missing" in out.err
 
+    def test_kcs_silent_held_chips_back_on_second_read_no_second_pulse(
+        self, tmp_path, capsys
+    ):
+        # Mock only. The pulse went through but the held chips need a second read to show
+        # ok: the reset polls them before deciding, so the pulse is not sent again.
+        import tt_smi.reset as reset_mod
+
+        host, _ = self._e3963(tmp_path)
+        host.kcs_pulse_acts = True
+        host.mc_info = ["ok", "fail", "ok"]
+        real = reset_mod.chip_reset_state
+        real_rescan = reset_mod.rescan_pci
+        st = {"armed": False, "n": 0}
+
+        def rescan(*a, **k):
+            st["armed"] = True
+            return real_rescan(*a, **k)
+
+        def late(bdf, *a, **k):
+            if st["armed"]:
+                st["n"] += 1
+                if st["n"] <= 7:  # first poll of the 7 held chips
+                    return "gone"
+            return real(bdf, *a, **k)
+
+        with patch("tt_smi.reset.chip_reset_state", side_effect=late), patch(
+            "tt_smi.reset.rescan_pci", side_effect=rescan
+        ):
+            host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
+        assert "the pulse went through: not sent again" in out.out
+        assert "sending the pulse once more" not in out.out
+        assert host.ipmi[:3] == [
+            ("0x4", GLX_IPMI_OP_MODE_RELEASE),
+            ("0x4", GLX_IPMI_OP_MODE_HOLD),
+            ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
+        ]
+
     def test_kcs_silent_for_good_names_every_held_chip_and_exits_non_zero(
         self, tmp_path, capsys
     ):
@@ -1029,7 +1067,12 @@ class TestFullRecoveryReset:
             GLX_IPMI_OP_MODE_NO_RETIMER,
         ]
         assert len(host.mc_calls) > 3  # it waited, not one 10 s check
-        assert f"not answering for {IPMI_RECOVER_TIMEOUT_S} s" in out.err
+        assert (
+            f"release pulse sent, reply lost; in-band IPMI silent for "
+            f"{IPMI_RECOVER_TIMEOUT_S} s; tray(s) 3 may still be held"
+        ) in out.err
+        # one announce for the wait's many polls (plus the two earlier checks)
+        assert out.out.count("Executing command: sudo ipmitool mc info") == 3
         assert "Tray(s) 3 may still be held in reset" in out.err
         for bdf in self.TRAY3:
             assert f"Hardware fault: chip {bdf} (tray 3) still missing" in out.err
