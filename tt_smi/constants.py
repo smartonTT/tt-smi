@@ -8,6 +8,7 @@ from tt_umd import (
     TopologyDiscoveryOptions,
 )
 
+
 def get_default_discovery_options():
     options = TopologyDiscoveryOptions()
     options.eth_fw_mismatch_action = TopologyDiscoveryOptions.Action.IGNORE
@@ -18,6 +19,7 @@ def get_default_discovery_options():
     if hasattr(options, "device_open_failure_action"):
         options.device_open_failure_action = TopologyDiscoveryOptions.Action.IGNORE
     return options
+
 
 SMBUS_TELEMETRY_LIST = [
     "BOARD_ID",
