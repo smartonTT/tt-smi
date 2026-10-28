@@ -349,6 +349,25 @@ class TestRescanRecount:
 # ---------------------------------------------------------------- glx_6u_trays_reset flow
 
 
+_REAL_READ = reset._read_arc_heartbeat
+
+
+def _desc(fs):
+    desc = MagicMock()
+    desc.get_chip_pci_bdfs.return_value = dict(enumerate(sorted(fs.chips)))
+    return desc
+
+
+def _ticking():
+    seen = {}
+
+    def read(chip, use_umd):
+        seen[chip] = seen.get(chip, 0) + 1
+        return seen[chip]
+
+    return read
+
+
 @pytest.fixture
 def glx(tmp_path, no_sleep):
     fs = FakeSysfs(tmp_path)
@@ -370,7 +389,10 @@ def glx(tmp_path, no_sleep):
     ), patch(
         "tt_smi.reset.timed_wait"
     ), patch(
-        "tt_smi.reset.TopologyDiscovery.discover", return_value=(None, {})
+        "tt_smi.reset.TopologyDiscovery.discover",
+        return_value=(_desc(fs), {i: f"chip{i}" for i in range(len(fs.chips))}),
+    ), patch(
+        "tt_smi.reset._read_arc_heartbeat", side_effect=_ticking()
     ):
         yield fs, ioctl_calls
 
@@ -628,8 +650,10 @@ class TestHeartbeatCheck:
         assert dead == ["0000:01:00.0", "0000:c1:00.0"]
 
     def _flow(self, glx, beats):
-        chips = {i: b for i, b in enumerate(self.BDFS)}
-        seen = {b: 0 for b in self.BDFS}
+        fs, _ = glx
+        chips = {i: b for i, b in enumerate(sorted(fs.chips))}
+        seen = {b: 0 for b in chips.values()}
+        beats = {**{b: [1, 2] for b in chips.values()}, **beats}
 
         def read(chip, use_umd):
             v = beats[chip][seen[chip]]
@@ -638,7 +662,8 @@ class TestHeartbeatCheck:
 
         return (
             patch(
-                "tt_smi.reset.TopologyDiscovery.discover", return_value=(None, chips)
+                "tt_smi.reset.TopologyDiscovery.discover",
+                return_value=(_desc(fs), chips),
             ),
             patch("tt_smi.reset._chip_bdf", side_effect=lambda c, u: c),
             patch("tt_smi.reset._read_arc_heartbeat", side_effect=read),
@@ -662,3 +687,91 @@ class TestHeartbeatCheck:
             with pytest.raises(SystemExit) as exc:
                 glx_6u_trays_reset(use_umd=True)
         assert exc.value.code == 0
+
+
+class TestHeartbeatRealReads:
+    """Real _read_arc_heartbeat and _chip_bdf on fake UMD chips (#4628). Mock only."""
+
+    def _chip(self, arch, ticking=True):
+        n = [0]
+
+        class Reader:
+            def __init__(self, *a):
+                pass
+
+            def read_entry(self, tag):
+                if ticking:
+                    n[0] += 1
+                return n[0]
+
+        chip = MagicMock()
+        chip.get_arch.return_value = arch
+        chip.get_arc_telemetry_reader.return_value = Reader()
+        return chip, Reader
+
+    def _flow(self, fs, skip=None, raises=False, stuck=None):
+        bdfs = sorted(fs.chips)
+        devices, bdf_map = {}, {}
+        Reader = None
+        for i, b in enumerate(bdfs):
+            arch = reset.ARCH.WORMHOLE_B0 if i % 2 else reset.ARCH.BLACKHOLE
+            chip, Reader = self._chip(arch, ticking=(b != stuck))
+            bdf_map[i] = b
+            if b != skip:
+                devices[i] = chip
+        desc = MagicMock()
+        desc.get_chip_pci_bdfs.return_value = bdf_map
+        # WH chips are read through SmBusArcTelemetryReader(chip): give it a ticking reader.
+        counters = {}
+
+        def wh_reader(chip):
+            counters[id(chip)] = counters.get(id(chip), 0) + 1
+            return MagicMock(read_entry=lambda tag: counters[id(chip)] * 0 + next(tick))
+
+        tick = iter(range(1, 10**6))
+        discover = (
+            patch("tt_smi.reset.TopologyDiscovery.discover", side_effect=RuntimeError("no"))
+            if raises
+            else patch(
+                "tt_smi.reset.TopologyDiscovery.discover", return_value=(desc, devices)
+            )
+        )
+        return discover, patch("tt_smi.reset.SmBusArcTelemetryReader", side_effect=wh_reader)
+
+    def _run(self, glx, capsys, **kw):
+        fs, _ = glx
+        d, r = self._flow(fs, **kw)
+        with patch("tt_smi.reset.subprocess.run", side_effect=[ok(), ok()]), d, r, patch(
+            "tt_smi.reset.time.sleep"
+        ), patch("tt_smi.reset._read_arc_heartbeat", new=_REAL_READ):
+            with pytest.raises(SystemExit) as exc:
+                glx_6u_trays_reset(use_umd=True)
+        return exc.value.code, capsys.readouterr().out, fs
+
+    def test_healthy_box_exit_0(self, glx, capsys):
+        code, out, _ = self._run(glx, capsys)
+        assert code == 0
+        assert "heartbeat" not in out.lower()
+
+    def test_skipped_chip_named_exit_5(self, glx, capsys):
+        fs, _ = glx
+        skip = sorted(fs.chips)[3]
+        code, out, _ = self._run(glx, capsys, skip=skip)
+        assert code == reset.GLX_EXIT_NO_HEARTBEAT
+        assert f"{skip} (tray" in out and "UBB" not in out
+        assert out.count("(tray") == 1
+
+    def test_stuck_chip_named_exit_5(self, glx, capsys):
+        fs, _ = glx
+        stuck = sorted(fs.chips)[4]  # a BH chip
+        code, out, _ = self._run(glx, capsys, stuck=stuck)
+        assert code == reset.GLX_EXIT_NO_HEARTBEAT
+        assert f"{stuck} (tray" in out
+
+    def test_discovery_raises_names_present_unverified(self, glx, capsys):
+        fs, _ = glx
+        code, out, _ = self._run(glx, capsys, raises=True)
+        assert code == 1
+        assert "unverified" in out
+        assert all(f"{b} (tray" in out for b in fs.chips)
+        assert "UBB" not in out
