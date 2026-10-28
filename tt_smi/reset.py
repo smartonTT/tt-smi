@@ -111,12 +111,13 @@ def chip_reset_state(bdf: str, check_marker: bool = True) -> str:
     """
     try:
         with open(os.path.join(SYSFS_PCI_DEVICES, bdf, "config"), "rb") as f:
-            config = f.read(8)
+            config = f.read(12)
     except OSError as e:
         return f"gone from PCI ({e.strerror or e})"
     if len(config) < 8:
         return "config space unreadable"
-    if config[0:2] == b"\xff\xff":
+    # Vendor ff, or revision ff (OM-F3-GBH02 47:00.0 read vendor fine but rev ff): dead.
+    if config[0:2] == b"\xff\xff" or (len(config) > 8 and config[8] == 0xFF):
         return "config space reads all ones (chip not responding)"
     command = int.from_bytes(config[4:6], "little")
     if check_marker and command & PCI_COMMAND_RESET_MARKER:
@@ -1389,6 +1390,29 @@ def _target_bdfs(reset_input: SmiDeviceInput, chips) -> List[str]:
     return [info.pci_bdf for info in chips.values()]
 
 
+class UnopenedDevicesError(Exception):
+    """tt-umd discovery left PCI devices out because opening them failed."""
+
+    def __init__(self, devices):
+        self.devices = devices  # list of (bdf, tray or None, error)
+        super().__init__(
+            "tt-umd could not open: "
+            + "; ".join(f"{b} (tray {t if t else '?'}): {e}" for b, t, e in devices)
+        )
+
+
+def _check_unopened(descriptor) -> None:
+    """Raise UnopenedDevicesError if discovery skipped any device (IGNORE action)."""
+    getter = getattr(descriptor, "get_unopened_devices", None)
+    if getter is None:
+        return
+    devices = [
+        ((d.pci_bdf or "").lower(), d.tray_id, d.error) for d in getter().values()
+    ]
+    if devices:
+        raise UnopenedDevicesError(devices)
+
+
 def _umd_unreadable_ids(err: Exception) -> List[int]:
     """Chip ids tt-umd discovery read 0xffffffff from ("Read 0xffffffff over PCIe ID 8")."""
     return sorted(
@@ -1419,6 +1443,8 @@ def _recover_after_failed_reinit(
     wormhole = any(info.device_id == WORMHOLE_DEVICE_ID for info in chips.values())
     bdfs = sorted({info.pci_bdf for info in chips.values()})
     unreadable = {chips[i].pci_bdf for i in _umd_unreadable_ids(err) if i in chips}
+    if isinstance(err, UnopenedDevicesError):
+        unreadable |= {b for b, _, _ in err.devices if b in bdfs}
     lost = [
         b
         for b in bdfs
@@ -1742,6 +1768,19 @@ def luwen_pci_reset(
         )
 
 
+def _name_dead_chips(err: Exception) -> None:
+    """Name each chip still dead (unopened by tt-umd) by BDF and tray as a hardware fault."""
+    if isinstance(err, UnopenedDevicesError):
+        for bdf, tray, msg in err.devices:
+            print(
+                CMD_LINE_COLOR.RED,
+                f"Hardware fault: chip {bdf} (tray {tray if tray else '?'}) "
+                f"stays dead after reset and tray re-power: {msg}",
+                CMD_LINE_COLOR.ENDC,
+                file=sys.stderr,
+            )
+
+
 def pci_board_reset(
     reset_input: SmiDeviceInput,
     reinit: bool = False,
@@ -1773,7 +1812,8 @@ def pci_board_reset(
                 if eth_train_skip:
                     options.discover_remote_devices = False
                     options.wait_on_ethernet_link_training = False
-                TopologyDiscovery.discover(options=options)
+                result = TopologyDiscovery.discover(options=options)
+                _check_unopened(result[0] if isinstance(result, tuple) else result)
             else:
                 os.environ["RUST_BACKTRACE"] = "full"
                 detect_chips_with_callback(
@@ -1798,6 +1838,7 @@ def pci_board_reset(
                     and reset_input.type == SmiDeviceTargetKind.ALL
                     and _recover_after_failed_reinit(err, all_trays, eth_train_skip)
                 ):
+                    _name_dead_chips(err)
                     sys.exit(1)
                 try:
                     reinit_chips()
@@ -1810,6 +1851,7 @@ def pci_board_reset(
                     )
                     err = e2
             else:
+                _name_dead_chips(err)
                 sys.exit(1)
 
 

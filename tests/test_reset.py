@@ -30,6 +30,10 @@ from tt_smi.reset import (
     BH_GALAXY_INBOX_MESH,
     check_inbox_links_after_repower,
     _links_down,
+    chip_reset_state,
+    _check_unopened,
+    _name_dead_chips,
+    UnopenedDevicesError,
 )
 from tt_smi.device_input import (
     classify_single_input,
@@ -268,6 +272,9 @@ class FakeGalaxy:
         data = b"\x3e\x1e\x00\xb1" + command.to_bytes(2, "little") + b"\x10\x00"
         if state == "ones":
             data = b"\xff" * 8
+        if state == "revff":
+            # Vendor and command read fine, revision reads ff (OM-F3-GBH02 47:00.0).
+            data += b"\xff\x00\x00\x00"
         (d / "config").write_bytes(data)
 
     def _set(self, bdf, state):
@@ -2464,3 +2471,56 @@ class TestGalaxyReset:
 
             post_reset_devices = redetect_devices(use_umd)
             assert len(post_reset_devices) == len(pci_indices)
+
+
+class TestRevFfAndUnopenedChips:
+    """Mock only: no hardware. Charter goal 17 exit rule (task #4372); hardware k/N is #4371."""
+
+    CHIP = "0000:47:00.0"  # OM-F3-GBH02, tray 2
+
+    def test_rev_ff_chip_is_not_live(self, tmp_path):
+        host = FakeGalaxy(tmp_path, states={self.CHIP: "revff"})
+        with patch("tt_smi.reset.SYSFS_PCI_DEVICES", str(host.root)):
+            assert "all ones" in chip_reset_state(self.CHIP, check_marker=False)
+            assert chip_reset_state("0000:04:00.0", check_marker=False) == "ok"
+
+    def test_rev_ff_chip_gets_its_tray_repower(self, tmp_path, capsys):
+        host = FakeGalaxy(
+            tmp_path, states={self.CHIP: "revff"}, heal={self.CHIP: "tray"}
+        )
+        code, _, _ = host.reset(ok=True)
+        out = capsys.readouterr()
+        assert code is None
+        assert host.ipmi[0] == ("0x2", GLX_IPMI_OP_MODE_NO_RETIMER)  # tray 2 pulse
+        assert all(state == "ok" for state in host.state.values())
+
+    def test_still_dead_rev_ff_chip_exits_nonzero(self, tmp_path, capsys):
+        host = FakeGalaxy(tmp_path, states={self.CHIP: "revff"})
+        host.heal[self.CHIP] = "never"
+        code, _, _ = host.reset(ok=True)
+        out = capsys.readouterr()
+        assert code not in (None, 0)
+        assert host.ipmi  # the pulse fired
+        assert f"Chip {self.CHIP} (tray 2)" in out.err
+
+    def test_all_live_exits_zero(self, tmp_path):
+        host = FakeGalaxy(tmp_path)
+        code, _, _ = host.reset(ok=True)
+        assert code is None
+        assert host.ipmi == []
+
+    def test_unopened_devices_raise_and_are_named(self, capsys):
+        dev = MagicMock(pci_bdf="0000:47:00.0", tray_id=2, error="open failed")
+        desc = MagicMock()
+        desc.get_unopened_devices.return_value = {7: dev}
+        with pytest.raises(UnopenedDevicesError) as exc:
+            _check_unopened(desc)
+        _name_dead_chips(exc.value)
+        err = capsys.readouterr().err
+        assert "0000:47:00.0" in err and "tray 2" in err and "Hardware fault" in err
+
+    def test_no_unopened_devices_passes(self):
+        desc = MagicMock()
+        desc.get_unopened_devices.return_value = {}
+        _check_unopened(desc)
+        _check_unopened(object())  # older tt-umd: no method
