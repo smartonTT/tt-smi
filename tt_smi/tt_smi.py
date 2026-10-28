@@ -138,7 +138,7 @@ def parse_args():
         "--allow_legacy_retimer_reset",
         default=False,
         action="store_true",
-        help="With -glx_reset: on a BMC older than v0.05.22 (rejects op_mode 0x3), fall back to legacy op_mode 0x0, which also resets the PCIe retimers",
+        help="With -glx_reset: on a BMC older than v0.05.22 (rejects op_mode 0x3), fall back to legacy op_mode 0x0, which also resets the PCIe retimers. Implied on a BMC known to be older than v0.05.22",
     )
     parser.add_argument(
         "--no_reinit",

@@ -986,11 +986,30 @@ def glx_6u_trays_reset(
         )
 
     # IPMI reset without PCIe retimer (BMC v0.05.22+). op_mode 0x0 asserts
-    # RST_RETIMER_PERST_N and can drop NVMe: only on a 0xc9 rejection, by opt-in.
+    # RST_RETIMER_PERST_N and can drop NVMe: used on a 0xc9 rejection when the
+    # flag is given, when the BMC is known to be older than v0.05.22, or when
+    # the BMC version could not be read (same as main).
     try:
-        run_galaxy_ipmi_reset_with_bmc_retry(
-            ubb_num, dev_num, op_mode, reset_time, allow_legacy_retimer_reset
-        )
+        try:
+            run_galaxy_ipmi_reset_with_bmc_retry(
+                ubb_num, dev_num, op_mode, reset_time, allow_legacy_retimer_reset
+            )
+        except GalaxyIpmiParamError:
+            if bmc_version is not None or allow_legacy_retimer_reset:
+                raise
+            print(
+                f"{CMD_LINE_COLOR.YELLOW}Warning: the BMC rejected op_mode {op_mode} (0xc9) and its "
+                f"firmware version could not be read; chips are already in reset, so falling "
+                f"back to legacy op_mode {GLX_IPMI_OP_MODE_WITH_RETIMER} "
+                f"(also resets the PCIe retimers).{CMD_LINE_COLOR.ENDC}"
+            )
+            run_galaxy_ipmi_reset_with_bmc_retry(
+                ubb_num,
+                dev_num,
+                GLX_IPMI_OP_MODE_WITH_RETIMER,
+                reset_time,
+                True,
+            )
     except RuntimeError as e:
         held = sorted(expected, key=lambda b: (tray_of_bdf(b, ubb_bus_ids), b))
         msg = (

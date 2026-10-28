@@ -431,14 +431,37 @@ class TestBmcVersionDecision:
 
     def test_old_bmc_without_flag_decided_before_resets(self, glx, capsys):
         fs, ioctl_calls = glx
-        with patch("tt_smi.reset.subprocess.run", side_effect=[mc_info("0x21")]):
+        seen = []
+
+        def run(cmd, **kw):
+            seen.append(len(ioctl_calls))  # resets issued when `mc info` ran
+            return mc_info("0x21")
+
+        with patch("tt_smi.reset.subprocess.run", side_effect=run):
             with patch.object(
                 reset, "run_galaxy_ipmi_reset_with_bmc_retry", side_effect=SystemExit(0)
             ) as retry:
                 with pytest.raises(SystemExit):
                     glx_6u_trays_reset(use_umd=True)
+        assert seen == [0]
+        assert ioctl_calls  # the resets did run, after the decision
         assert retry.call_args[0][4] is True
         assert "older than v0.05.22" in capsys.readouterr().out
+
+    def test_unreadable_version_c9_falls_back_to_op0(self, glx, capsys):
+        fs, ioctl_calls = glx
+
+        def run(cmd, **kw):
+            if cmd[2:5] == ["raw", "0x30", "0x8B"]:
+                return fail(self.C9) if cmd[7] == "0x3" else ok()
+            return mc_info("0x1a")  # hex letters: version not read
+
+        with patch("tt_smi.reset.subprocess.run", side_effect=run) as m:
+            with pytest.raises(SystemExit) as exc:
+                glx_6u_trays_reset(use_umd=True)
+        assert exc.value.code == 0
+        assert op_modes(m) == ["0x3", GLX_IPMI_OP_MODE_WITH_RETIMER]
+        assert "could not be read" in capsys.readouterr().out
 
     def test_old_bmc_with_flag_reaches_op0(self, glx):
         def run(cmd, **kw):
