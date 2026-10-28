@@ -469,7 +469,8 @@ def _read_arc_heartbeat(chip, use_umd: bool) -> int:
         arch = chip.get_arch()
         if arch == ARCH.WORMHOLE_B0:
             reader = SmBusArcTelemetryReader(chip)
-            tag = wormhole.TelemetryTag.TIMER_HEARTBEAT
+            # WH telemetry has no TIMER_HEARTBEAT; ARC0_HEALTH is its ARC0 heartbeat counter.
+            tag = wormhole.TelemetryTag.ARC0_HEALTH
         elif arch == ARCH.BLACKHOLE:
             reader = chip.get_arc_telemetry_reader()
             tag = TelemetryTag.TIMER_HEARTBEAT

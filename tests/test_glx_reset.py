@@ -730,20 +730,27 @@ class TestHeartbeatRealReads:
 
         tick = iter(range(1, 10**6))
         discover = (
-            patch("tt_smi.reset.TopologyDiscovery.discover", side_effect=RuntimeError("no"))
+            patch(
+                "tt_smi.reset.TopologyDiscovery.discover",
+                side_effect=RuntimeError("no"),
+            )
             if raises
             else patch(
                 "tt_smi.reset.TopologyDiscovery.discover", return_value=(desc, devices)
             )
         )
-        return discover, patch("tt_smi.reset.SmBusArcTelemetryReader", side_effect=wh_reader)
+        return discover, patch(
+            "tt_smi.reset.SmBusArcTelemetryReader", side_effect=wh_reader
+        )
 
     def _run(self, glx, capsys, **kw):
         fs, _ = glx
         d, r = self._flow(fs, **kw)
-        with patch("tt_smi.reset.subprocess.run", side_effect=[ok(), ok()]), d, r, patch(
-            "tt_smi.reset.time.sleep"
-        ), patch("tt_smi.reset._read_arc_heartbeat", new=_REAL_READ):
+        with patch(
+            "tt_smi.reset.subprocess.run", side_effect=[ok(), ok()]
+        ), d, r, patch("tt_smi.reset.time.sleep"), patch(
+            "tt_smi.reset._read_arc_heartbeat", new=_REAL_READ
+        ):
             with pytest.raises(SystemExit) as exc:
                 glx_6u_trays_reset(use_umd=True)
         return exc.value.code, capsys.readouterr().out, fs
