@@ -732,13 +732,14 @@ class TestFullRecoveryReset:
         host.mc_info = ["ok", mode]
         code, reinit_ran, _ = host.reset(ok=False, missing=[self.LOST])
         out = capsys.readouterr()
-        assert host.mc_calls == [10, 10]
+        # Round 2 waits up to IPMI_RECOVER_TIMEOUT_S for the BMC, not one 10 s check.
+        assert len(host.mc_calls) > 3 and set(host.mc_calls) == {10}
         assert host.ipmi == [("0x2", GLX_IPMI_OP_MODE_NO_RETIMER)]  # no 0xF
         self.assert_stopped_after_round_1(host, code, reinit_ran, out)
         assert (
             f"Hardware fault: chip {self.LOST} (tray 2) still missing "
-            f"(in-band IPMI not answering; tray re-power skipped): gone from PCI"
-            in out.err
+            f"(in-band IPMI never answered again (silent for {IPMI_RECOVER_TIMEOUT_S} s); "
+            f"tray(s) 2 not re-powered): gone from PCI" in out.err
         )
         assert "after tray re-power" not in out.err
 
@@ -858,7 +859,8 @@ class TestFullRecoveryReset:
         assert [b for b, _ in host.ipmi] == ["0x2"]
         assert (
             f"Hardware fault: chip {lost} (tray 2) still missing "
-            "(in-band IPMI not answering; tray re-power skipped)" in err
+            f"(in-band IPMI never answered again (silent for {IPMI_RECOVER_TIMEOUT_S} s); "
+            "tray(s) 2 not re-powered)" in err
         )
 
     def test_umd_missing_list_alone_triggers_recovery(self, tmp_path, capsys):
@@ -1085,8 +1087,8 @@ class TestFullRecoveryReset:
         ]
         assert len(host.mc_calls) > 3  # it waited, not one 10 s check
         assert (
-            f"release pulse sent, reply lost; in-band IPMI silent for "
-            f"{IPMI_RECOVER_TIMEOUT_S} s; tray(s) 3 may still be held"
+            "release pulse sent, reply lost; in-band IPMI never answered again "
+            f"(silent for {IPMI_RECOVER_TIMEOUT_S} s); tray(s) 3 may still be held"
         ) in out.err
         # one announce for the wait's many polls (plus the two earlier checks)
         assert out.out.count("Executing command: sudo ipmitool mc info") == 3
@@ -1156,6 +1158,125 @@ class TestFullRecoveryReset:
         assert code is None and reinit_ran
         assert all(state == "ok" for state in host.state.values())
 
+    # Replays of #4177's three natural tray-3 losses on OM-E4-GBH02 (mock only).
+    LOSS3_SILENT_POLLS = 48  # ~8 min of 10 s mc info polls before the BMC answers again
+
+    @pytest.mark.parametrize("acts", [True, False])
+    def test_loss3_replay_ipmi_silent_8_min_then_round_2_brings_32(
+        self, tmp_path, capsys, acts
+    ):
+        # loss3: the tray-3 pulse reply was lost and in-band IPMI stayed silent ~8 min, past
+        # the old 300 s cap, so round 2 never ran (0/32). The wait now runs up to 15 min,
+        # then the recount finds every short tray and round 2 re-powers it.
+        host = self._natural_tray3(tmp_path, acts)
+        host.knock_others = acts
+        host.mc_info = ["ok"] + ["fail"] * self.LOSS3_SILENT_POLLS + ["ok"]
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
+        assert len(host.mc_calls) > self.LOSS3_SILENT_POLLS
+        round2 = "0xB" if acts else "0x4"
+        assert host.ipmi == [
+            ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
+            (round2, GLX_IPMI_OP_MODE_NO_RETIMER),
+        ]
+        assert "Recount after round 2: 32/32 chips" in out.out
+        assert code is None and reinit_ran
+        assert all(state == "ok" for state in host.state.values())
+
+    def test_loss3_replay_with_old_300_s_cap_never_reaches_round_2(
+        self, tmp_path, capsys
+    ):
+        # The same loss with the old cap: the wait expires, nothing more is sent, rc 1 and
+        # every missing chip is named. This is why the cap went to 900 s.
+        host = self._natural_tray3(tmp_path, acts=True)
+        host.knock_others = True
+        host.mc_info = ["ok"] + ["fail"] * self.LOSS3_SILENT_POLLS + ["ok"]
+        with patch("tt_smi.reset.IPMI_RECOVER_TIMEOUT_S", 300):
+            code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
+        assert code == 1 and not reinit_ran
+        assert host.ipmi == [("0x4", GLX_IPMI_OP_MODE_NO_RETIMER)]
+        assert "never answered again (silent for 300 s)" in out.err
+
+    def test_loss1_replay_knocked_trays_repowered_only_tray_3_named(
+        self, tmp_path, capsys
+    ):
+        # loss1: the tray-3 pulse was answered, trays 1, 2 and 4 dropped after it and tray 3
+        # never came back. Round 2 re-powers every short tray; only tray 3's chips, still
+        # missing after two re-powers of their own tray, are named as hardware faults.
+        host = FakeGalaxy(
+            tmp_path,
+            states={b: "ones" for b in self.TRAY3},
+            heal={b: "never" for b in self.TRAY3},
+            knock_others=True,
+        )
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
+        assert [b for b, _ in host.ipmi][:2] == ["0x4", "0xF"]
+        assert "Recount after round 1: 0/32 chips" in out.out
+        assert "Recount after round 2: 24/32 chips" in out.out
+        assert code == 1 and not reinit_ran
+        for bdf in self.TRAY3:
+            assert f"Hardware fault: chip {bdf} (tray 3) still missing" in out.err
+        assert out.err.count("Hardware fault: chip") == len(self.TRAY3)
+        assert all(
+            state == "ok" for b, state in host.state.items() if b not in self.TRAY3
+        )
+
+    def test_trays_lost_in_last_round_get_their_own_round(self, tmp_path, capsys):
+        # Mock only. Round 2's tray-3 pulse knocks trays 1, 2 and 4. They were present
+        # before the reset, so they count as short and get round 3 (0xB) instead of being
+        # left out after RECOVERY_MAX_ROUNDS rounds.
+        host = FakeGalaxy(
+            tmp_path,
+            states={b: "ones" for b in self.TRAY3},
+            heal={b: "never" for b in self.TRAY3},
+        )
+        run = host.run
+        pulses = []
+
+        def knock_on_second_pulse(cmd, **kwargs):
+            if cmd[:3] == ["sudo", "ipmitool", "raw"]:
+                pulses.append(cmd[5])
+                if len(pulses) == 2:
+                    host.knock_others = True
+            return run(cmd, **kwargs)
+
+        host.run = knock_on_second_pulse
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
+        assert [b for b, _ in host.ipmi][:3] == ["0x4", "0x4", "0xB"]
+        assert "Recount after round 2: 0/32 chips" in out.out
+        assert "Recount after round 3: 24/32 chips" in out.out
+        assert code == 1 and not reinit_ran
+        assert out.err.count("Hardware fault: chip") == len(self.TRAY3)
+        for bdf in self.TRAY3:
+            assert f"Hardware fault: chip {bdf} (tray 3) still missing" in out.err
+
+    def test_ipmi_silent_at_cap_before_round_2_names_every_chip(self, tmp_path, capsys):
+        # Mock only. Round 1's pulse knocked trays 1, 2 and 4 and tray 3 stays lost; the BMC
+        # then never answers before round 2. The reset waits the full cap, sends nothing,
+        # exits 1 and names all 32 chips by BDF and tray, saying IPMI never answered.
+        host = FakeGalaxy(
+            tmp_path,
+            states={b: "ones" for b in self.TRAY3},
+            heal={b: "never" for b in self.TRAY3},
+            knock_others=True,
+        )
+        host.mc_info = ["ok", "fail"]
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
+        assert host.ipmi == [("0x4", GLX_IPMI_OP_MODE_NO_RETIMER)]
+        assert len(host.mc_calls) > 3
+        assert code == 1 and not reinit_ran
+        assert (
+            f"in-band IPMI never answered again (silent for {IPMI_RECOVER_TIMEOUT_S} s)"
+            in out.err
+        )
+        for bdf in GALAXY_BDFS:
+            tray = GALAXY_BDFS.index(bdf) // 8 + 1
+            assert f"chip {bdf} (tray {tray}) still missing" in out.err
+
     def test_kcs_silent_for_good_without_hold_names_every_chip_and_exits_non_zero(
         self, tmp_path, capsys
     ):
@@ -1170,8 +1291,8 @@ class TestFullRecoveryReset:
         assert host.ipmi == [("0x4", GLX_IPMI_OP_MODE_NO_RETIMER)]
         assert len(host.mc_calls) > 3
         reason = (
-            "re-power pulse of tray(s) 3 sent, reply lost; in-band IPMI silent for "
-            f"{IPMI_RECOVER_TIMEOUT_S} s"
+            "re-power pulse of tray(s) 3 sent, reply lost; in-band IPMI never "
+            f"answered again (silent for {IPMI_RECOVER_TIMEOUT_S} s)"
         )
         assert reason in out.err
         assert "tray re-power skipped" not in out.err
@@ -1220,7 +1341,9 @@ class TestFullRecoveryReset:
         assert code == 1 and not reinit_ran
         assert host.ipmi == [("0xF", GLX_IPMI_OP_MODE_NO_RETIMER)]
         assert len(host.mc_calls) > 3
-        assert f"in-band IPMI silent for {IPMI_RECOVER_TIMEOUT_S} s" in out.err
+        assert (
+            f"never answered again (silent for {IPMI_RECOVER_TIMEOUT_S} s)" in out.err
+        )
         assert out.err.count("Hardware fault: chip") == 32
         for bdf in GALAXY_BDFS:
             assert f"Hardware fault: chip {bdf} (tray " in out.err

@@ -89,7 +89,9 @@ GALAXY_SUBSYSTEM_IDS = {0x35, 0x47, 0x202}
 GALAXY_TRAYS = (1, 2, 3, 4)
 GALAXY_CHIPS_PER_TRAY = 8
 WORMHOLE_DEVICE_ID = 0x401E
-# Rounds of tray re-power + PCI rescan for chips still missing after the warm reset.
+# Rounds of tray re-power + PCI rescan for chips still missing after the warm reset. On a
+# Galaxy this is per tray: a tray lost to another tray's pulse in the last round gets extra
+# rounds until it had this many re-powers of its own (task #4274).
 RECOVERY_MAX_ROUNDS = 2
 TRAY_REPOWER_WAIT_S = 30
 CHIP_RETURN_TIMEOUT_S = 60
@@ -336,8 +338,8 @@ def _wait_after_lost_reply(trays: List[int]) -> None:
     )
     if not _wait_ipmi_answers(IPMI_RECOVER_TIMEOUT_S):
         raise IpmiNotAnswering(
-            f"re-power pulse of {names} sent, reply lost; in-band IPMI silent for "
-            f"{IPMI_RECOVER_TIMEOUT_S} s"
+            f"re-power pulse of {names} sent, reply lost; in-band IPMI never answered "
+            f"again (silent for {IPMI_RECOVER_TIMEOUT_S} s)"
         )
     print(
         f"The BMC answers again; rescanning and recounting every chip after the pulse of "
@@ -363,8 +365,8 @@ def _release_held_trays(trays: List[int], held: List[str]) -> None:
     )
     if not _wait_ipmi_answers(IPMI_RECOVER_TIMEOUT_S):
         raise IpmiNotAnswering(
-            f"release pulse sent, reply lost; in-band IPMI silent for "
-            f"{IPMI_RECOVER_TIMEOUT_S} s; {names} may still be held"
+            f"release pulse sent, reply lost; in-band IPMI never answered again "
+            f"(silent for {IPMI_RECOVER_TIMEOUT_S} s); {names} may still be held"
         )
     timed_wait(TRAY_REPOWER_WAIT_S)
     if held:
@@ -444,8 +446,10 @@ def _tray_ipmi_hold(trays: List[int], bdfs: List[str]) -> List[str]:
 IPMI_CHECK_TIMEOUT_S = 10
 IPMI_SKIPPED = "in-band IPMI not answering; tray re-power skipped"
 # After a failed pulse that should release a held tray: how long to wait for the BMC to
-# answer in-band again, polling ``mc info`` every IPMI_RECOVER_POLL_S.
-IPMI_RECOVER_TIMEOUT_S = 300
+# answer in-band again, polling ``mc info`` every IPMI_RECOVER_POLL_S. OM-E4-GBH02 (task
+# #4177 loss3): after a lost tray-3 pulse reply in-band IPMI was silent about 8 min, so the
+# old 300 s wait expired and round 2 never ran (0/32).
+IPMI_RECOVER_TIMEOUT_S = 900
 IPMI_RECOVER_POLL_S = 10
 
 
@@ -567,6 +571,7 @@ def recover_missing_chips(
     known: Optional[List[str]] = None,
     repower: bool = True,
     repowered: Optional[set] = None,
+    own_repowered: Optional[set] = None,
 ) -> Tuple[List[str], Dict[int, int], Optional[str]]:
     """Bring back chips that did not come back from the warm reset.
 
@@ -584,7 +589,12 @@ def recover_missing_chips(
     rescans PCI, sends POST_RESET to the chips that got USER_RESET and recounts every chip.
     Returns the chips (by BDF) and short trays (tray -> chips present) still missing afterwards,
     and why recovery stopped early (None if it did not). Trays whose re-power pulse went through
-    are added to ``repowered``.
+    are added to ``repowered``; of those, the trays that were short when re-powered (their own
+    re-power, not the 0xF fallback covering a full tray) also to ``own_repowered``.
+    Every pulse is followed by a recount of every chip of ``known``: a tray lost to another
+    tray's pulse is short and gets its own re-power, even after the last of the
+    RECOVERY_MAX_ROUNDS rounds (task #4177 loss1/loss3: the tray-3 pulse dropped trays 1, 2
+    and 4). Rounds end once every short tray had RECOVERY_MAX_ROUNDS re-powers of its own.
     """
     allow_repower = repower
     stopped = None
@@ -597,17 +607,53 @@ def recover_missing_chips(
         if chip_reset_state(b).startswith("reset marker")
     }
     hold.discard(None)
-    for round_num in range(1, RECOVERY_MAX_ROUNDS + 1):
+    # Re-powers of its own per short tray (None: a chip outside the tray map).
+    own_tries: Dict[Optional[int], int] = {}
+    per_tray = is_galaxy and allow_repower
+    # Each round adds a re-power to at least one tray, so this bound is never the limit.
+    max_rounds = (
+        RECOVERY_MAX_ROUNDS * (len(GALAXY_TRAYS) + 1)
+        if per_tray
+        else RECOVERY_MAX_ROUNDS
+    )
+    round_num = 0
+    while round_num < max_rounds:
+        round_num += 1
         trays = sorted(
             {tray_of_bdf(b, wormhole) for b in missing} | set(short_trays), key=str
         )
-        if is_galaxy and allow_repower:
+        if per_tray:
+            due = [t for t in trays if own_tries.get(t, 0) < RECOVERY_MAX_ROUNDS]
+            if not due:
+                break
             # Only trays with a missing chip: a tray whose chips are all present is never
             # re-powered. A chip on a bus outside the tray map gets all four trays re-powered.
-            repower = list(GALAXY_TRAYS) if None in trays else trays
+            repower = list(GALAXY_TRAYS) if None in due else due
             # A re-power with no BMC answer can take healthy chips down (OM-F3-GBH01: 24/32
             # to 0/32), so check before every round: no answer, no SBR, USER_RESET or re-power.
-            if not _ipmi_answers():
+            # After an earlier round's pulse the BMC may be busy for minutes (task #4177
+            # loss3: about 8 min): poll for it, then re-power every short tray.
+            if round_num > 1 and not _ipmi_answers():
+                print(
+                    f"In-band IPMI does not answer before round {round_num}; waiting up to "
+                    f"{IPMI_RECOVER_TIMEOUT_S} s for it to answer again..."
+                )
+                if not _wait_ipmi_answers(IPMI_RECOVER_TIMEOUT_S):
+                    print(
+                        CMD_LINE_COLOR.RED,
+                        f"In-band IPMI never answered again within {IPMI_RECOVER_TIMEOUT_S} s: "
+                        f"tray(s) {', '.join(map(str, repower))} not re-powered.",
+                        CMD_LINE_COLOR.ENDC,
+                        file=sys.stderr,
+                    )
+                    return (
+                        sorted(set(missing) | held_unverified),
+                        short_trays,
+                        f"in-band IPMI never answered again (silent for "
+                        f"{IPMI_RECOVER_TIMEOUT_S} s); tray(s) "
+                        f"{', '.join(map(str, repower))} not re-powered",
+                    )
+            elif round_num == 1 and not _ipmi_answers():
                 print(
                     CMD_LINE_COLOR.RED,
                     "In-band IPMI (ipmitool mc info) did not answer within "
@@ -616,9 +662,14 @@ def recover_missing_chips(
                     file=sys.stderr,
                 )
                 return sorted(missing), short_trays, IPMI_SKIPPED
+            label = (
+                f"{round_num}/{RECOVERY_MAX_ROUNDS}"
+                if round_num <= RECOVERY_MAX_ROUNDS
+                else f"{round_num} (tray(s) lost after another tray's pulse)"
+            )
             print(
                 CMD_LINE_COLOR.PURPLE,
-                f"Recovery round {round_num}/{RECOVERY_MAX_ROUNDS}: re-powering tray(s) "
+                f"Recovery round {label}: re-powering tray(s) "
                 f"{', '.join(map(str, repower))}, then PCI rescan...",
                 CMD_LINE_COLOR.ENDC,
             )
@@ -633,6 +684,12 @@ def recover_missing_chips(
                 repowered_now = set(pulsed or repower)
                 if repowered is not None:
                     repowered.update(repowered_now)
+                for t in due:
+                    own_tries[t] = own_tries.get(t, 0) + 1
+                if own_repowered is not None:
+                    own_repowered.update(
+                        GALAXY_TRAYS if None in due else [t for t in due if t]
+                    )
             except RuntimeError as e:
                 if isinstance(e, TrayHeldError):
                     # The recount may find these chips, but the tray may still be held: the
