@@ -519,7 +519,12 @@ def galaxy_heartbeat_check(
         if first[i] is None or second is None or second == first[i]:
             dead.append(bdfs[i])
     checked = set(bdfs.values())
-    dead += [b for b in (present or []) if b not in checked]
+    unchecked = [b for b in (present or []) if b not in checked]
+    if unchecked:
+        # A chip whose BDF read failed is keyed unknown-<i>; present names its real
+        # BDF, so drop the placeholder and name each chip once.
+        dead = [b for b in dead if not b.startswith("unknown-")]
+    dead += unchecked
     return sorted(dead, key=lambda b: (tray_of_bdf(b, ubb_bus_ids), b))
 
 

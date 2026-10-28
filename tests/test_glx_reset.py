@@ -732,7 +732,7 @@ class TestHeartbeatRealReads:
         chip.get_arc_telemetry_reader.return_value = Reader()
         return chip, Reader
 
-    def _flow(self, fs, skip=None, raises=False, stuck=None):
+    def _flow(self, fs, skip=None, raises=False, stuck=None, nobdf=False):
         bdfs = sorted(fs.chips)
         devices, bdf_map = {}, {}
         Reader = None
@@ -740,9 +740,12 @@ class TestHeartbeatRealReads:
             arch = reset.ARCH.WORMHOLE_B0 if i % 2 else reset.ARCH.BLACKHOLE
             chip, Reader = self._chip(arch, ticking=(b != stuck))
             bdf_map[i] = b
+            chip.get_pci_device.return_value.get_device_info.return_value.pci_bdf = b
             if b != skip:
                 devices[i] = chip
         desc = MagicMock()
+        if nobdf:
+            del bdf_map[0]
         desc.get_chip_pci_bdfs.return_value = bdf_map
         # WH chips are read through SmBusArcTelemetryReader(chip): give it a ticking reader.
         counters = {}
@@ -791,6 +794,12 @@ class TestHeartbeatRealReads:
         assert f"{skip} (tray" in out and "UBB" not in out
         assert out.count("(tray") == 1
 
+    def test_chip_bdf_fallback_healthy_exit_0(self, glx, capsys):
+        # get_chip_pci_bdfs() lacks a device: the real _chip_bdf runs on UMD chips.
+        code, out, _ = self._run(glx, capsys, nobdf=True)
+        assert code == 0
+        assert "heartbeat" not in out.lower()
+
     def test_stuck_chip_named_exit_5(self, glx, capsys):
         fs, _ = glx
         stuck = sorted(fs.chips)[4]  # a BH chip
@@ -805,3 +814,15 @@ class TestHeartbeatRealReads:
         assert "unverified" in out
         assert all(f"{b} (tray" in out for b in fs.chips)
         assert "UBB" not in out
+
+
+class TestHeartbeatUnknownBdf:
+    """A chip whose BDF read fails is named once by its real BDF (mock only)."""
+
+    def test_unknown_placeholder_dropped_when_present_names_it(self):
+        bdf = "0000:47:00.0"
+        with patch("tt_smi.reset._chip_bdf", side_effect=OSError("no bdf")), patch(
+            "tt_smi.reset._read_arc_heartbeat", return_value=5
+        ), patch("tt_smi.reset.time.sleep"):
+            dead = reset.galaxy_heartbeat_check(["chip"], False, gap_s=0, present=[bdf])
+        assert dead == [bdf]
