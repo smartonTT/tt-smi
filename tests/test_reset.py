@@ -2489,7 +2489,7 @@ class TestRevFfAndUnopenedChips:
             tmp_path, states={self.CHIP: "revff"}, heal={self.CHIP: "tray"}
         )
         code, _, _ = host.reset(ok=True)
-        out = capsys.readouterr()
+        capsys.readouterr()
         assert code is None
         assert host.ipmi[0] == ("0x2", GLX_IPMI_OP_MODE_NO_RETIMER)  # tray 2 pulse
         assert all(state == "ok" for state in host.state.values())
@@ -2524,3 +2524,21 @@ class TestRevFfAndUnopenedChips:
         desc.get_unopened_devices.return_value = {}
         _check_unopened(desc)
         _check_unopened(object())  # older tt-umd: no method
+
+    def test_pci_board_reset_unopened_chip_exits_1_and_names_it(self, capsys):
+        dev = MagicMock(pci_bdf=self.CHIP, tray_id=2, error="open failed")
+        desc = MagicMock()
+        desc.get_unopened_devices.return_value = {7: dev}
+        reset_input = MagicMock(type=SmiDeviceTargetKind.ALL)
+        with patch("tt_smi.reset.umd_pci_warm_reset"), patch(
+            "tt_smi.reset.get_default_discovery_options"
+        ), patch(
+            "tt_smi.reset.TopologyDiscovery.discover", return_value=desc
+        ), patch(
+            "tt_smi.reset._recover_after_failed_reinit", return_value=False
+        ):
+            with pytest.raises(SystemExit) as exc:
+                pci_board_reset(reset_input, reinit=True, use_umd=True)
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert f"chip {self.CHIP} (tray 2)" in err and "Hardware fault" in err
