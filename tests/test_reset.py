@@ -1143,7 +1143,8 @@ class TestFullRecoveryReset:
     ):
         # Mock only. fix-d1's shape: the tray-3 pulse went out, its reply was lost and trays
         # 1, 2 and 4 read all ones afterwards. Once the BMC answers, the recount finds them
-        # and round 2 re-powers only the trays still short (1, 2, 4; tray 3 is back).
+        # and round 2 re-powers them with one all-tray 0xF pulse, never another per-tray
+        # pulse (task #4275: per-tray pulses there are not tray-local).
         host = self._natural_tray3(tmp_path, acts=True)
         host.knock_others = True
         host.mc_info = ["ok", "fail", "fail", "ok"]
@@ -1151,7 +1152,7 @@ class TestFullRecoveryReset:
         out = capsys.readouterr()
         assert host.ipmi == [
             ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
-            ("0xB", GLX_IPMI_OP_MODE_NO_RETIMER),
+            ("0xF", GLX_IPMI_OP_MODE_NO_RETIMER),
         ]
         assert "Recount after round 1: 8/32 chips" in out.out
         assert "Recount after round 2: 32/32 chips" in out.out
@@ -1167,19 +1168,21 @@ class TestFullRecoveryReset:
     ):
         # loss3: the tray-3 pulse reply was lost and in-band IPMI stayed silent ~8 min, past
         # the old 300 s cap, so round 2 never ran (0/32). The wait now runs up to 15 min,
-        # then the recount finds every short tray and round 2 re-powers it.
+        # then the recount finds every short tray and round 2 re-powers it: trays lost to the
+        # tray-3 pulse get one all-tray 0xF pulse, never a per-tray 0xB (task #4275).
         host = self._natural_tray3(tmp_path, acts)
         host.knock_others = acts
         host.mc_info = ["ok"] + ["fail"] * self.LOSS3_SILENT_POLLS + ["ok"]
         code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
         out = capsys.readouterr()
         assert len(host.mc_calls) > self.LOSS3_SILENT_POLLS
-        round2 = "0xB" if acts else "0x4"
+        round2 = "0xF" if acts else "0x4"
         assert host.ipmi == [
             ("0x4", GLX_IPMI_OP_MODE_NO_RETIMER),
             (round2, GLX_IPMI_OP_MODE_NO_RETIMER),
         ]
         assert "Recount after round 2: 32/32 chips" in out.out
+        assert ("cost tray(s) 1, 2, 4" in out.out) == acts
         assert code is None and reinit_ran
         assert all(state == "ok" for state in host.state.values())
 
@@ -1202,8 +1205,9 @@ class TestFullRecoveryReset:
         self, tmp_path, capsys
     ):
         # loss1: the tray-3 pulse was answered, trays 1, 2 and 4 dropped after it and tray 3
-        # never came back. Round 2 re-powers every short tray; only tray 3's chips, still
-        # missing after two re-powers of their own tray, are named as hardware faults.
+        # never came back. Round 2 re-powers every short tray with one all-tray 0xF pulse and
+        # nothing follows it; only tray 3's chips, still missing after two re-powers that
+        # covered their tray, are named as hardware faults.
         host = FakeGalaxy(
             tmp_path,
             states={b: "ones" for b in self.TRAY3},
@@ -1212,7 +1216,13 @@ class TestFullRecoveryReset:
         )
         code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
         out = capsys.readouterr()
-        assert [b for b, _ in host.ipmi][:2] == ["0x4", "0xF"]
+        assert [b for b, _ in host.ipmi] == ["0x4", "0xF"]
+        # Trays 1, 2 and 4 are named as lost to the tray-3 pulse (tray 3 was already gone).
+        assert "The per-tray pulse of tray(s) 3 cost tray(s) 1, 2, 4" in out.out
+        for bdf in GALAXY_BDFS:
+            if bdf not in self.TRAY3:
+                tray = GALAXY_BDFS.index(bdf) // 8 + 1
+                assert f"{bdf} (tray {tray})" in out.out
         assert "Recount after round 1: 0/32 chips" in out.out
         assert "Recount after round 2: 24/32 chips" in out.out
         assert code == 1 and not reinit_ran
@@ -1225,8 +1235,8 @@ class TestFullRecoveryReset:
 
     def test_trays_lost_in_last_round_get_their_own_round(self, tmp_path, capsys):
         # Mock only. Round 2's tray-3 pulse knocks trays 1, 2 and 4. They were present
-        # before the reset, so they count as short and get round 3 (0xB) instead of being
-        # left out after RECOVERY_MAX_ROUNDS rounds.
+        # before the reset, so they count as short and get round 3, one all-tray 0xF pulse
+        # (not a per-tray 0xB), instead of being left out after RECOVERY_MAX_ROUNDS rounds.
         host = FakeGalaxy(
             tmp_path,
             states={b: "ones" for b in self.TRAY3},
@@ -1245,7 +1255,7 @@ class TestFullRecoveryReset:
         host.run = knock_on_second_pulse
         code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
         out = capsys.readouterr()
-        assert [b for b, _ in host.ipmi][:3] == ["0x4", "0x4", "0xB"]
+        assert [b for b, _ in host.ipmi] == ["0x4", "0x4", "0xF"]
         assert "Recount after round 2: 0/32 chips" in out.out
         assert "Recount after round 3: 24/32 chips" in out.out
         assert code == 1 and not reinit_ran
@@ -1276,6 +1286,77 @@ class TestFullRecoveryReset:
         for bdf in GALAXY_BDFS:
             tray = GALAXY_BDFS.index(bdf) // 8 + 1
             assert f"chip {bdf} (tray {tray}) still missing" in out.err
+            # Only tray 3 was re-powered: its chips are hardware faults, the rest are not
+            # judged (their trays were never re-powered).
+            label = (
+                "Hardware fault"
+                if bdf in self.TRAY3
+                else "Not re-powered (in-band IPMI never answered)"
+            )
+            assert f"{label}: chip {bdf} (tray {tray}) still missing" in out.err
+        assert out.err.count("Hardware fault: chip") == len(self.TRAY3)
+
+    def test_cascade_every_per_tray_pulse_knocks_others_one_0xf_brings_32(
+        self, tmp_path, capsys
+    ):
+        # Mock only (reviewer #4297's scratch case, task #4275's shape): every per-tray pulse
+        # leaves every other tray reading all ones; one all-tray pulse heals the box. The
+        # reset must send exactly one per-tray pulse, then one 0xF, and end 32/32 (e3bbc89
+        # sent 0x4, 0xB, 0x4, 0xB and named tray 3's healthy chips as hardware faults).
+        host = FakeGalaxy(
+            tmp_path,
+            states={b: "ones" for b in self.TRAY3},
+            heal={b: "tray" for b in self.TRAY3},
+        )
+        run = host.run
+
+        def knock_always(cmd, **kwargs):
+            if cmd[:3] == ["sudo", "ipmitool", "raw"]:
+                host.knock_others = True
+            return run(cmd, **kwargs)
+
+        host.run = knock_always
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
+        assert [b for b, _ in host.ipmi] == ["0x4", "0xF"]
+        assert "Recount after round 1: 8/32 chips" in out.out
+        assert "Recount after round 2: 32/32 chips" in out.out
+        assert "The per-tray pulse of tray(s) 3 cost tray(s) 1, 2, 4" in out.out
+        for bdf in GALAXY_BDFS:
+            if bdf not in self.TRAY3:
+                tray = GALAXY_BDFS.index(bdf) // 8 + 1
+                assert f"{bdf} (tray {tray})" in out.out
+        assert code is None and reinit_ran
+        assert "Hardware fault" not in out.err
+        assert all(state == "ok" for state in host.state.values())
+
+    def test_pulse_that_costs_one_chip_of_another_tray_gets_one_0xf(
+        self, tmp_path, capsys
+    ):
+        # Mock only. The tray-3 pulse costs a single chip of tray 1 (healed only by an
+        # all-tray pulse): that is a cascade too, so round 2 is 0xF, not a tray-1 0x1.
+        knocked = GALAXY_BDFS[0]
+        host = FakeGalaxy(
+            tmp_path,
+            states={b: "ones" for b in self.TRAY3},
+            heal={b: "tray" for b in self.TRAY3},
+        )
+        run = host.run
+
+        def knock_one(cmd, **kwargs):
+            result = run(cmd, **kwargs)
+            if cmd[:3] == ["sudo", "ipmitool", "raw"] and cmd[5] != "0xF":
+                host._set(knocked, "ones")
+                host.heal[knocked] = "all"
+            return result
+
+        host.run = knock_one
+        code, reinit_ran, _ = host.reset(ok=False, missing=self.TRAY3)
+        out = capsys.readouterr()
+        assert [b for b, _ in host.ipmi] == ["0x4", "0xF"]
+        assert f"cost tray(s) 1: lost {knocked} (tray 1)" in out.out
+        assert code is None and reinit_ran
+        assert all(state == "ok" for state in host.state.values())
 
     def test_kcs_silent_for_good_without_hold_names_every_chip_and_exits_non_zero(
         self, tmp_path, capsys
@@ -1614,7 +1695,8 @@ class TestFullRecoveryReset:
         code, reinit_ran, _ = host.reset(ok=False, missing=[lost])
         out = capsys.readouterr().out
         assert code is None and reinit_ran
-        assert [m for m, _ in host.ipmi] == ["0x4", "0xB"]  # trays 1, 2 and 4
+        # Trays 1, 2 and 4 lost to the tray-3 pulse: one all-tray pulse, never a per-tray 0xB.
+        assert [m for m, _ in host.ipmi] == ["0x4", "0xF"]
         assert "Recount after round 2: 32/32 chips" in out
         assert all(state == "ok" for state in host.state.values())
 

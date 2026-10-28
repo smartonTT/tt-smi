@@ -445,6 +445,10 @@ def _tray_ipmi_hold(trays: List[int], bdfs: List[str]) -> List[str]:
 
 IPMI_CHECK_TIMEOUT_S = 10
 IPMI_SKIPPED = "in-band IPMI not answering; tray re-power skipped"
+# Start of the stop reason when the BMC stays silent before a later round (see
+# recover_missing_chips); chips of trays never re-powered then are not hardware faults.
+IPMI_SILENT_AT_CAP = "in-band IPMI never answered again"
+NOT_REPOWERED_LABEL = "Not re-powered (in-band IPMI never answered)"
 # After a failed pulse that should release a held tray: how long to wait for the BMC to
 # answer in-band again, polling ``mc info`` every IPMI_RECOVER_POLL_S. OM-E4-GBH02 (task
 # #4177 loss3): after a lost tray-3 pulse reply in-band IPMI was silent about 8 min, so the
@@ -592,9 +596,12 @@ def recover_missing_chips(
     are added to ``repowered``; of those, the trays that were short when re-powered (their own
     re-power, not the 0xF fallback covering a full tray) also to ``own_repowered``.
     Every pulse is followed by a recount of every chip of ``known``: a tray lost to another
-    tray's pulse is short and gets its own re-power, even after the last of the
+    tray's pulse is short and gets re-powered, even after the last of the
     RECOVERY_MAX_ROUNDS rounds (task #4177 loss1/loss3: the tray-3 pulse dropped trays 1, 2
-    and 4). Rounds end once every short tray had RECOVERY_MAX_ROUNDS re-powers of its own.
+    and 4). Once a per-tray pulse costs trays outside it, no more per-tray pulses are sent:
+    every later round is one all-tray 0xF pulse (task #4275: on OM-E4-GBH02 a tray-3-only
+    pulse on a healthy box dropped trays 1, 2 and 4, so per-tray pulses there can cascade).
+    Rounds end once every short tray had RECOVERY_MAX_ROUNDS re-powers.
     """
     allow_repower = repower
     stopped = None
@@ -610,6 +617,8 @@ def recover_missing_chips(
     # Re-powers of its own per short tray (None: a chip outside the tray map).
     own_tries: Dict[Optional[int], int] = {}
     per_tray = is_galaxy and allow_repower
+    # Set once a per-tray pulse cost other trays: from then on only all-tray pulses.
+    all_trays_only = False
     # Each round adds a re-power to at least one tray, so this bound is never the limit.
     max_rounds = (
         RECOVERY_MAX_ROUNDS * (len(GALAXY_TRAYS) + 1)
@@ -628,7 +637,7 @@ def recover_missing_chips(
                 break
             # Only trays with a missing chip: a tray whose chips are all present is never
             # re-powered. A chip on a bus outside the tray map gets all four trays re-powered.
-            repower = list(GALAXY_TRAYS) if None in due else due
+            repower = list(GALAXY_TRAYS) if None in due or all_trays_only else due
             # A re-power with no BMC answer can take healthy chips down (OM-F3-GBH01: 24/32
             # to 0/32), so check before every round: no answer, no SBR, USER_RESET or re-power.
             # After an earlier round's pulse the BMC may be busy for minutes (task #4177
@@ -649,7 +658,7 @@ def recover_missing_chips(
                     return (
                         sorted(set(missing) | held_unverified),
                         short_trays,
-                        f"in-band IPMI never answered again (silent for "
+                        f"{IPMI_SILENT_AT_CAP} (silent for "
                         f"{IPMI_RECOVER_TIMEOUT_S} s); tray(s) "
                         f"{', '.join(map(str, repower))} not re-powered",
                     )
@@ -667,6 +676,8 @@ def recover_missing_chips(
                 if round_num <= RECOVERY_MAX_ROUNDS
                 else f"{round_num} (tray(s) lost after another tray's pulse)"
             )
+            if all_trays_only:
+                label += " (all-tray pulse: a per-tray pulse cost other trays)"
             print(
                 CMD_LINE_COLOR.PURPLE,
                 f"Recovery round {label}: re-powering tray(s) "
@@ -675,6 +686,8 @@ def recover_missing_chips(
             )
             user_reset: List[str] = []
             repowered_now = set(repower)
+            before_missing = set(missing)
+            before_short = dict(short_trays)
             try:
                 pulsed = _repower_trays(
                     repower, wormhole, user_reset, tuple(sorted(hold & set(repower)))
@@ -773,6 +786,14 @@ def recover_missing_chips(
                     file=sys.stderr,
                 )
             hold.discard(None)
+            if (
+                not stopped
+                and not all_trays_only
+                and repowered_now != set(GALAXY_TRAYS)
+            ):
+                all_trays_only = _log_trays_lost_to_pulse(
+                    repowered_now, before_missing, before_short, still, short, wormhole
+                )
         bdfs = set(present.values())
         missing = sorted(set(still))
         short_trays = short
@@ -786,6 +807,57 @@ def recover_missing_chips(
             break
     missing = sorted(set(missing) | held_unverified)
     return missing, short_trays, stopped if (missing or short_trays) else None
+
+
+def _fault_label(tray: Optional[int], stopped: Optional[str], repowered: set) -> str:
+    """How a chip or tray still missing is named: a hardware fault only once a re-power
+    covered its tray; at the IPMI-silent cap a tray never re-powered is not judged."""
+    if stopped and stopped.startswith(IPMI_SILENT_AT_CAP) and tray not in repowered:
+        return NOT_REPOWERED_LABEL
+    return "Hardware fault"
+
+
+def _log_trays_lost_to_pulse(
+    pulsed: set,
+    before_missing: set,
+    before_short: Dict[int, int],
+    still: List[str],
+    short: Dict[int, int],
+    wormhole: bool,
+) -> bool:
+    """After a per-tray pulse of ``pulsed``: log every chip lost on the other trays.
+
+    A chip is lost to the pulse if it was present before it, is missing now and its tray was
+    not pulsed; a tray outside ``pulsed`` with fewer chips than before also counts (its chips
+    may not be in ``known``). Returns True if the pulse cost any other tray.
+    """
+    lost = sorted(
+        b
+        for b in still
+        if b not in before_missing and tray_of_bdf(b, wormhole) not in pulsed
+    )
+    trays = {tray_of_bdf(b, wormhole) for b in lost} | {
+        t
+        for t, n in short.items()
+        if t not in pulsed and n < before_short.get(t, GALAXY_CHIPS_PER_TRAY)
+    }
+    trays.discard(None)
+    if not trays:
+        return False
+    named = {tray_of_bdf(b, wormhole) for b in lost}
+    chips = [_chip_label(b, True, wormhole) for b in lost] + [
+        f"tray {t}: {short[t]}/{GALAXY_CHIPS_PER_TRAY} chips"
+        for t in sorted(trays - named)
+        if t in short
+    ]
+    print(
+        CMD_LINE_COLOR.YELLOW,
+        f"The per-tray pulse of tray(s) {', '.join(map(str, sorted(pulsed)))} cost tray(s) "
+        f"{', '.join(map(str, sorted(trays)))}: lost {', '.join(chips)}. No more per-tray "
+        "pulses: the lost trays get one all-tray 0xF pulse.",
+        CMD_LINE_COLOR.ENDC,
+    )
+    return True
 
 
 LINK_READ_TIMEOUT_S = 120
@@ -992,9 +1064,10 @@ def check_inbox_links_after_repower(
         if still or still_short or stopped:
             how = f"({stopped})" if stopped else "after the link re-power"
             for bdf in still:
+                label = _fault_label(tray_of_bdf(bdf, wormhole), stopped, repowered)
                 print(
                     CMD_LINE_COLOR.RED,
-                    f"Hardware fault: chip {_chip_label(bdf, True, wormhole)} missing {how}: "
+                    f"{label}: chip {_chip_label(bdf, True, wormhole)} missing {how}: "
                     f"{fault_state(bdf)}",
                     CMD_LINE_COLOR.ENDC,
                     file=sys.stderr,
@@ -1002,7 +1075,8 @@ def check_inbox_links_after_repower(
             for tray, count in sorted(still_short.items()):
                 print(
                     CMD_LINE_COLOR.RED,
-                    f"Hardware fault: tray {tray} has {count}/{GALAXY_CHIPS_PER_TRAY} chips {how}",
+                    f"{_fault_label(tray, stopped, repowered)}: tray {tray} has "
+                    f"{count}/{GALAXY_CHIPS_PER_TRAY} chips {how}",
                     CMD_LINE_COLOR.ENDC,
                     file=sys.stderr,
                 )
@@ -1397,9 +1471,10 @@ def _recover_after_failed_reinit(
         return True
     how = f"({stopped})" if stopped else "after tray re-power and PCI rescan"
     for bdf in still:
+        label = _fault_label(tray_of_bdf(bdf, wormhole), stopped, repowered)
         print(
             CMD_LINE_COLOR.RED,
-            f"Hardware fault: chip {_chip_label(bdf, is_galaxy, wormhole)} still missing {how}: "
+            f"{label}: chip {_chip_label(bdf, is_galaxy, wormhole)} still missing {how}: "
             f"{fault_state(bdf)}",
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
@@ -1407,7 +1482,8 @@ def _recover_after_failed_reinit(
     for tray, count in sorted(still_short.items()):
         print(
             CMD_LINE_COLOR.RED,
-            f"Hardware fault: tray {tray} has {count}/{GALAXY_CHIPS_PER_TRAY} chips {how}",
+            f"{_fault_label(tray, stopped, repowered)}: tray {tray} has "
+            f"{count}/{GALAXY_CHIPS_PER_TRAY} chips {how}",
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
         )
@@ -1558,9 +1634,10 @@ def umd_pci_warm_reset(
         + ("tray re-power and PCI rescan" if is_galaxy and full else "PCI rescan")
     )
     for bdf in still:
+        label = _fault_label(tray_of_bdf(bdf, wormhole), stopped, repowered)
         print(
             CMD_LINE_COLOR.RED,
-            f"Hardware fault: chip {_chip_label(bdf, is_galaxy, wormhole)} still missing {how}: "
+            f"{label}: chip {_chip_label(bdf, is_galaxy, wormhole)} still missing {how}: "
             f"{fault_state(bdf)}",
             CMD_LINE_COLOR.ENDC,
             file=sys.stderr,
@@ -1578,7 +1655,8 @@ def umd_pci_warm_reset(
         if tray not in named:
             print(
                 CMD_LINE_COLOR.RED,
-                f"Hardware fault: tray {tray} has {count}/{GALAXY_CHIPS_PER_TRAY} chips {how} "
+                f"{_fault_label(tray, stopped, repowered)}: tray {tray} has "
+                f"{count}/{GALAXY_CHIPS_PER_TRAY} chips {how} "
                 "(the missing chip was not on PCI before the reset, so its BDF is not known)",
                 CMD_LINE_COLOR.ENDC,
                 file=sys.stderr,
