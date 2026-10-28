@@ -53,7 +53,9 @@ GLX_IPMI_OP_MODE_NO_RETIMER = "0x3"
 # Exit codes of glx_6u_trays_reset beyond 0/1 (see GalaxyResetError).
 GLX_EXIT_BMC_FAILED = 3  # IPMI step failed after USER_RESET: chips held in reset
 GLX_EXIT_CHIPS_MISSING = 4  # reset done, but some chips did not come back on PCIe
+GLX_EXIT_NO_HEARTBEAT = 5  # chips back on PCIe, but an ARC heartbeat is stuck
 GLX_EXPECTED_CHIPS = 32
+GLX_HEARTBEAT_GAP_S = 1.0
 BMC_PREFLIGHT_TIMEOUT_S = 15
 BMC_RECOVER_TIMEOUT_S = 300
 BMC_POLL_INTERVAL_S = 10
@@ -425,6 +427,59 @@ def galaxy_rescan_and_recount(
         rescans += 1
         time.sleep(interval_s)
     return sorted(missing, key=lambda b: (tray_of_bdf(b, ubb_bus_ids), b)), present
+
+
+def _chip_bdf(chip, use_umd: bool) -> str:
+    if use_umd:
+        return chip.get_pci_device().get_device_info().pci_bdf
+    return chip.get_pci_bdf()
+
+
+def _read_arc_heartbeat(chip, use_umd: bool) -> int:
+    """One ARC heartbeat read, through the telemetry read tt-smi already uses."""
+    if use_umd:
+        if chip.get_arch() == ARCH.WORMHOLE_B0:
+            reader = SmBusArcTelemetryReader(chip)
+            tag = wormhole.TelemetryTag.TIMER_HEARTBEAT
+        else:
+            reader = chip.get_arc_telemetry_reader()
+            tag = TelemetryTag.TIMER_HEARTBEAT
+        return int(reader.read_entry(tag.value))
+    telem = chip.as_bh() or chip.as_wh()
+    return int(telem.get_telemetry().timer_heartbeat)
+
+
+def galaxy_heartbeat_check(
+    chips: list, use_umd: bool, ubb_bus_ids: dict = None, gap_s: float = None
+) -> list:
+    """
+    Read each chip's ARC heartbeat twice, gap_s apart. A chip whose value does not
+    advance, or whose read fails, is a hardware fault. A chip's failure does not
+    stop the others. Returns the BDFs that did not respond, sorted by tray.
+    """
+    gap_s = GLX_HEARTBEAT_GAP_S if gap_s is None else gap_s
+    bdfs = {}
+    first = {}
+    for i, chip in enumerate(chips):
+        try:
+            bdf = _chip_bdf(chip, use_umd)
+        except Exception:
+            bdf = f"unknown-{i}"
+        bdfs[i] = bdf
+        try:
+            first[i] = _read_arc_heartbeat(chip, use_umd)
+        except Exception:
+            first[i] = None
+    time.sleep(gap_s)
+    dead = []
+    for i, chip in enumerate(chips):
+        try:
+            second = _read_arc_heartbeat(chip, use_umd)
+        except Exception:
+            second = None
+        if first[i] is None or second is None or second == first[i]:
+            dead.append(bdfs[i])
+    return sorted(dead, key=lambda b: (tray_of_bdf(b, ubb_bus_ids), b))
 
 
 def _chip_lines(bdfs, expected: dict, ubb_bus_ids: dict) -> str:
@@ -954,12 +1009,14 @@ def glx_6u_trays_reset(
             options.wait_on_ethernet_link_training = False
             _, devices = TopologyDiscovery.discover(options=options)
             chip_count = len(devices)
+            hb_chips = list(devices.values())
         else:
             os.environ["RUST_BACKTRACE"] = "full"
             chips = detect_chips_with_callback(
                 local_only=True, ignore_ethernet=True, print_status=print_status
             )
             chip_count = len(chips)
+            hb_chips = list(chips)
     except Exception as e:
         print(
             CMD_LINE_COLOR.RED,
@@ -973,4 +1030,17 @@ def glx_6u_trays_reset(
         f"Re-initialized {chip_count} boards after reset. Exiting...",
         CMD_LINE_COLOR.ENDC,
     )
+    try:
+        no_heartbeat = galaxy_heartbeat_check(hb_chips, use_umd, ubb_bus_ids)
+    except Exception as e:
+        print(CMD_LINE_COLOR.RED, f"Heartbeat check failed: {e}", CMD_LINE_COLOR.ENDC)
+        report_and_exit(1)
+    if no_heartbeat:
+        print(
+            CMD_LINE_COLOR.RED,
+            "Hardware fault: ARC heartbeat did not advance (or could not be read) on:\n"
+            + _chip_lines(no_heartbeat, expected, ubb_bus_ids),
+            CMD_LINE_COLOR.ENDC,
+        )
+        report_and_exit(GLX_EXIT_NO_HEARTBEAT)
     report_and_exit(0)

@@ -513,3 +513,82 @@ class TestCliExitCodes:
             with pytest.raises(SystemExit):
                 cli.main()
         assert fn.call_args[1]["allow_legacy_retimer_reset"] is True
+
+
+class TestHeartbeatCheck:
+    """ARC heartbeat after the recount (#281 item 2). Mock only."""
+
+    BDFS = ["0000:01:00.0", "0000:47:00.0", "0000:c1:00.0"]
+
+    def run(self, beats, sleep=None):
+        """beats: bdf -> [first, second]; an Exception entry is a failed read."""
+        chips = list(self.BDFS)
+        seen = {b: 0 for b in chips}
+
+        def read(chip, use_umd):
+            v = beats[chip][seen[chip]]
+            seen[chip] += 1
+            if isinstance(v, Exception):
+                raise v
+            return v
+
+        with patch("tt_smi.reset._chip_bdf", side_effect=lambda c, u: c), patch(
+            "tt_smi.reset._read_arc_heartbeat", side_effect=read
+        ), patch("tt_smi.reset.time.sleep") as slp:
+            dead = reset.galaxy_heartbeat_check(chips, False, gap_s=sleep)
+        return dead, slp
+
+    def test_all_advance(self):
+        dead, slp = self.run({b: [10, 11] for b in self.BDFS})
+        assert dead == []
+        slp.assert_called_once_with(reset.GLX_HEARTBEAT_GAP_S)
+
+    def test_stuck_chip_named_by_bdf_and_tray(self):
+        beats = {b: [10, 11] for b in self.BDFS}
+        beats["0000:47:00.0"] = [7, 7]
+        dead, _ = self.run(beats)
+        assert dead == ["0000:47:00.0"]
+        assert reset._chip_lines(dead, {}, None) == "  0000:47:00.0 (tray 2)"
+
+    def test_read_failure_counts_as_stuck(self):
+        beats = {b: [10, 11] for b in self.BDFS}
+        beats["0000:c1:00.0"] = [10, OSError("read failed")]
+        beats["0000:01:00.0"] = [OSError("read failed"), 11]
+        dead, _ = self.run(beats)
+        assert dead == ["0000:01:00.0", "0000:c1:00.0"]
+
+    def _flow(self, glx, beats):
+        chips = {i: b for i, b in enumerate(self.BDFS)}
+        seen = {b: 0 for b in self.BDFS}
+
+        def read(chip, use_umd):
+            v = beats[chip][seen[chip]]
+            seen[chip] += 1
+            return v
+
+        return (
+            patch(
+                "tt_smi.reset.TopologyDiscovery.discover", return_value=(None, chips)
+            ),
+            patch("tt_smi.reset._chip_bdf", side_effect=lambda c, u: c),
+            patch("tt_smi.reset._read_arc_heartbeat", side_effect=read),
+        )
+
+    def test_full_flow_exit_5_names_chip(self, glx, capsys):
+        beats = {b: [10, 11] for b in self.BDFS}
+        beats["0000:47:00.0"] = [7, 7]
+        d, b, r = self._flow(glx, beats)
+        with patch("tt_smi.reset.subprocess.run", side_effect=[ok(), ok()]), d, b, r:
+            with pytest.raises(SystemExit) as exc:
+                glx_6u_trays_reset(use_umd=True)
+        assert exc.value.code == reset.GLX_EXIT_NO_HEARTBEAT
+        out = capsys.readouterr().out
+        assert "0000:47:00.0 (tray 2" in out and "UBB" not in out
+        assert "0000:01:00.0" not in out
+
+    def test_full_flow_exit_0_when_all_respond(self, glx):
+        d, b, r = self._flow(glx, {x: [1, 2] for x in self.BDFS})
+        with patch("tt_smi.reset.subprocess.run", side_effect=[ok(), ok()]), d, b, r:
+            with pytest.raises(SystemExit) as exc:
+                glx_6u_trays_reset(use_umd=True)
+        assert exc.value.code == 0
