@@ -58,16 +58,16 @@ class TestGalaxyIpmiReset:
         with patch(
             "tt_smi.reset.subprocess.run", side_effect=[fail_new, ok_old]
         ) as mock_run:
-            run_galaxy_ipmi_reset(allow_legacy_retimer_reset=True)
+            run_galaxy_ipmi_reset()
         assert mock_run.call_count == 2
         assert mock_run.call_args_list[0][0][0][7] == GLX_IPMI_OP_MODE_NO_RETIMER
         assert mock_run.call_args_list[1][0][0][7] == GLX_IPMI_OP_MODE_WITH_RETIMER
 
-    def test_other_ipmi_failure_raises_without_legacy_retimer_reset(self):
+    def test_other_ipmi_failure_raises_without_legacy_fallback(self):
         fail_new = MagicMock(returncode=1, stdout="", stderr="Could not open device")
         with patch("tt_smi.reset.subprocess.run", side_effect=[fail_new]) as mock_run:
             with pytest.raises(RuntimeError, match="Could not open device"):
-                run_galaxy_ipmi_reset(allow_legacy_retimer_reset=True)
+                run_galaxy_ipmi_reset()
         assert mock_run.call_count == 1
 
     def test_fallback_failure_raises_runtime_error(self):
@@ -75,7 +75,7 @@ class TestGalaxyIpmiReset:
         fail_old = MagicMock(returncode=1, stdout="", stderr="Could not open device")
         with patch("tt_smi.reset.subprocess.run", side_effect=[fail_new, fail_old]):
             with pytest.raises(RuntimeError, match="IPMI command failed"):
-                run_galaxy_ipmi_reset(allow_legacy_retimer_reset=True)
+                run_galaxy_ipmi_reset()
 
     def test_missing_ipmitool_raises_runtime_error(self):
         with patch(

@@ -26,7 +26,6 @@ from tt_smi.utils import check_is_galaxy, is_vm
 from tt_smi.reset import (
     pci_board_reset,
     glx_6u_trays_reset,
-    GalaxyResetError,
 )
 from tt_smi.device_input import parse_smi_device_input
 from tt_smi.frontend import TTSMI
@@ -115,7 +114,7 @@ def parse_args():
         "--galaxy_6u_trays_reset",
         default=False,
         action="store_true",
-        help="Reset all the ASICs on the galaxy host with no PCIe retimer reset (BMC v0.05.22+), then rescan and recount until all 32 chips are back. Exit 3: BMC reset failed, chips held in reset; exit 4: chips missing after reset",
+        help="Reset all the ASICs on the galaxy host; prefers no PCIe retimer reset (BMC v0.05.22+), falls back to legacy retimer reset",
         dest="glx_reset",
     )
     parser.add_argument(
@@ -133,12 +132,6 @@ def parse_args():
         action="store_true",
         help="List the mapping of devices to trays on the galaxy",
         dest="glx_list_tray_to_device",
-    )
-    parser.add_argument(
-        "--allow_legacy_retimer_reset",
-        default=False,
-        action="store_true",
-        help="With -glx_reset: on a BMC older than v0.05.22 (rejects op_mode 0x3), fall back to legacy op_mode 0x0, which also resets the PCIe retimers. Implied on a BMC known to be older than v0.05.22",
     )
     parser.add_argument(
         "--no_reinit",
@@ -183,7 +176,7 @@ def tt_smi_main(backend: TTSMIBackend, args):
             print(
                 CMD_LINE_COLOR.RED,
                 "This is in a VM, so we cannot list the tray and device mapping.",
-                CMD_LINE_COLOR.ENDC,
+                CMD_LINE_COLOR.ENDC
             )
             sys.exit(1)
         backend.print_tray_and_device_mapping()
@@ -200,9 +193,7 @@ def tt_smi_main(backend: TTSMIBackend, args):
         )
         sys.exit(0)
     if not sys.stdin.isatty():
-        print(
-            f"{CMD_LINE_COLOR.RED}No TTY detected! Interactive shell required.\nUse tt-smi -s for snapshot output.{CMD_LINE_COLOR.ENDC}"
-        )
+        print(f"{CMD_LINE_COLOR.RED}No TTY detected! Interactive shell required.\nUse tt-smi -s for snapshot output.{CMD_LINE_COLOR.ENDC}")
         sys.exit(1)
     tt_smi_app = TTSMI(
         backend=backend,
@@ -212,7 +203,6 @@ def tt_smi_main(backend: TTSMIBackend, args):
         offline=args.offline,
     )
     tt_smi_app.run()
-
 
 def main():
     """
@@ -242,27 +232,14 @@ def main():
     # Handle reset first, without setting up backend
     if args.reset is not None:
         reset_input = parse_smi_device_input(args.reset)
-        pci_board_reset(
-            reset_input,
-            reinit=not (args.no_reinit),
-            print_status=is_tty,
-            use_umd=not args.use_luwen,
-            eth_train_skip=args.eth_train_skip,
-        )
+        pci_board_reset(reset_input, reinit=not(args.no_reinit), print_status=is_tty, use_umd=not args.use_luwen, eth_train_skip=args.eth_train_skip)
         sys.exit(0)
     # Handle ubb reset without backend
     if args.glx_reset:
         # Galaxy reset, without auto retries
         try:
             # reinit has to be enabled to detect devices post reset
-            glx_6u_trays_reset(
-                reinit=not (args.no_reinit),
-                print_status=is_tty,
-                use_umd=not args.use_luwen,
-                allow_legacy_retimer_reset=args.allow_legacy_retimer_reset,
-            )
-        except GalaxyResetError as e:
-            sys.exit(e.exit_code)
+            glx_6u_trays_reset(reinit=not(args.no_reinit), print_status=is_tty, use_umd=not args.use_luwen)
         except Exception as e:
             print(
                 CMD_LINE_COLOR.RED,
@@ -288,16 +265,8 @@ def main():
             try:
                 # Try to reset galaxy 6u trays
                 # reinit has to be enabled to detect devices post reset
-                glx_6u_trays_reset(
-                    reinit=True,
-                    print_status=is_tty,
-                    use_umd=not args.use_luwen,
-                    allow_legacy_retimer_reset=args.allow_legacy_retimer_reset,
-                )
+                glx_6u_trays_reset(reinit=True, print_status=is_tty, use_umd=not args.use_luwen)
                 break  # If reset was successful, break the loop
-            except GalaxyResetError as e:
-                # Chips are held in reset: a retry cannot finish it, escalate.
-                sys.exit(e.exit_code)
             except Exception as e:
                 reset_try_number += 1
                 if reset_try_number < max_reset_try:
@@ -319,20 +288,12 @@ def main():
 
     try:
         if not args.use_luwen:
-            cluster_descriptor, devices = TopologyDiscovery.discover(
-                options=constants.get_default_discovery_options()
-            )
+            cluster_descriptor, devices = TopologyDiscovery.discover(options=constants.get_default_discovery_options())
         else:
             cluster_descriptor = None
-            devices = dict(
-                enumerate(
-                    detect_chips_with_callback(
-                        local_only=args.local,
-                        ignore_ethernet=args.local,
-                        print_status=is_tty,
-                    )
-                )
-            )
+            devices = dict(enumerate(detect_chips_with_callback(
+                local_only=args.local, ignore_ethernet=args.local, print_status=is_tty
+            )))
     except Exception as e:
         print(
             CMD_LINE_COLOR.RED,
@@ -347,9 +308,7 @@ def main():
             CMD_LINE_COLOR.ENDC,
         )
         sys.exit(1)
-    backend = TTSMIBackend(
-        devices=devices, umd_cluster_descriptor=cluster_descriptor, pretty_output=is_tty
-    )
+    backend = TTSMIBackend(devices=devices, umd_cluster_descriptor=cluster_descriptor, pretty_output=is_tty)
 
     tt_smi_main(backend, args)
 
