@@ -465,7 +465,9 @@ class TestOneChipFailureDoesNotStopOthers:
     def test_bdf_of_interface_from_sysfs(self, tmp_path):
         cls = tmp_path / "class" / "tenstorrent" / "tenstorrent!3"
         cls.mkdir(parents=True)
-        os.symlink("../../../devices/pci0000:40/0000:40:01.7/0000:47:00.0", cls / "device")
+        os.symlink(
+            "../../../devices/pci0000:40/0000:40:01.7/0000:47:00.0", cls / "device"
+        )
         assert reset._bdf_of_interface(3, str(tmp_path)) == "0000:47:00.0"
         assert reset._bdf_of_interface(4, str(tmp_path)) == ""
 
