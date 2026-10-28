@@ -8,12 +8,13 @@ Device-selection parsing for ``-r`` / ``--reset`` lives in
 :mod:`tt_smi.device_input`; this module focuses on the reset mechanism itself.
 """
 
+import re
 import os
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import List
+from typing import List, Optional, Tuple
 
 from tt_tools_common.ui_common.themes import CMD_LINE_COLOR
 from tt_tools_common.reset_common.wh_reset import WHChipReset
@@ -76,11 +77,6 @@ class GalaxyResetError(RuntimeError):
 
 class GalaxyIpmiParamError(RuntimeError):
     """The BMC rejected op_mode 0x3 with completion code 0xc9 (BMC older than v0.05.22)."""
-
-
-def _ipmi_output_is_param_out_of_range(output: str) -> bool:
-    text = output.lower()
-    return "rsp=0xc9" in text or "parameter out of range" in text
 
 
 def _ipmi_output_is_param_out_of_range(output: str) -> bool:
@@ -173,21 +169,49 @@ def run_galaxy_ipmi_reset(
         raise RuntimeError(f"IPMI command failed: {fallback_failure}")
 
 
-def bmc_answers(timeout_s: int = BMC_PREFLIGHT_TIMEOUT_S) -> str:
+def parse_bmc_version(mc_info: str) -> Optional[Tuple[int, int, int]]:
     """
-    Send in-band Get Device ID (ipmitool mc info). Return "" if the BMC
-    answered, else what went wrong.
+    BMC firmware version from `ipmitool mc info` text: Firmware Revision
+    (major.minor) plus the Aux Firmware Rev byte, e.g. 0.05 + 0x23 = (0, 5, 23).
+    None if either is missing or unreadable.
+    """
+    rev = re.search(r"Firmware Revision\s*:\s*(\d+)\.(\d+)", mc_info)
+    aux = re.search(r"Aux Firmware Rev Info\s*:\s*\n?\s*0x([0-9a-fA-F]{2})", mc_info)
+    if not rev or not aux:
+        return None
+    # The Aux byte is shown in hex but read as the decimal patch number (0x23 = .23).
+    patch_digits = aux.group(1)
+    if not patch_digits.isdigit():
+        return None
+    return int(rev.group(1)), int(rev.group(2)), int(patch_digits)
+
+
+def bmc_is_older_than_no_retimer_reset(version: Tuple[int, int, int]) -> bool:
+    minimum = tuple(int(x) for x in MINIMUM_BMC_VERSION_NO_RETIMER_RESET.split("."))
+    return version < minimum
+
+
+def bmc_mc_info(timeout_s: int = BMC_PREFLIGHT_TIMEOUT_S) -> Tuple[str, str]:
+    """
+    Send in-band Get Device ID (ipmitool mc info). Return (failure, stdout):
+    failure is "" if the BMC answered, else what went wrong.
     """
     cmd = ["sudo", "ipmitool", "mc", "info"]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
-        return f"no answer within {timeout_s} s"
+        return f"no answer within {timeout_s} s", ""
     except FileNotFoundError as e:
         raise RuntimeError(
             "Failed to execute ipmitool. Ensure ipmitool is installed and sudo is available."
         ) from e
-    return _ipmi_failure_detail(result)
+    stdout = result.stdout if isinstance(result.stdout, str) else ""
+    return _ipmi_failure_detail(result), stdout
+
+
+def bmc_answers(timeout_s: int = BMC_PREFLIGHT_TIMEOUT_S) -> str:
+    """Return "" if the BMC answers Get Device ID, else what went wrong."""
+    return bmc_mc_info(timeout_s)[0]
 
 
 def run_galaxy_ipmi_reset_with_bmc_retry(
@@ -880,11 +904,28 @@ def glx_6u_trays_reset(
     )
 
     # Do not put any chip in reset unless the BMC can finish the reset.
-    preflight = bmc_answers(BMC_PREFLIGHT_TIMEOUT_S)
+    preflight, mc_info = bmc_mc_info(BMC_PREFLIGHT_TIMEOUT_S)
     if preflight:
         raise RuntimeError(
             "BMC does not answer in-band Get Device ID (ipmitool mc info): "
             f"{preflight}\nNo chip was reset."
+        )
+    # The op mode the BMC accepts must be known before any chip is reset.
+    bmc_version = parse_bmc_version(mc_info)
+    if bmc_version is None:
+        print(
+            f"{CMD_LINE_COLOR.YELLOW}Warning: BMC firmware version was not read from "
+            f"ipmitool mc info; trying op_mode {op_mode} as is.{CMD_LINE_COLOR.ENDC}"
+        )
+    elif bmc_is_older_than_no_retimer_reset(bmc_version):
+        # Same as main: an old BMC rejects op_mode 0x3 (0xc9) and the reset
+        # finishes with legacy op_mode 0x0. Decided here, before any chip resets.
+        allow_legacy_retimer_reset = True
+        print(
+            f"{CMD_LINE_COLOR.YELLOW}BMC firmware {'.'.join('%02d' % v for v in bmc_version)} "
+            f"is older than v{MINIMUM_BMC_VERSION_NO_RETIMER_RESET}: op_mode {op_mode} will be "
+            f"rejected, the reset will use legacy op_mode {GLX_IPMI_OP_MODE_WITH_RETIMER} "
+            f"(also resets the PCIe retimers).{CMD_LINE_COLOR.ENDC}"
         )
 
     print(

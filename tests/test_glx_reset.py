@@ -375,6 +375,76 @@ def glx(tmp_path, no_sleep):
         yield fs, ioctl_calls
 
 
+def mc_info(aux="0x23"):
+    text = (
+        "Device ID : 32\nFirmware Revision : 0.05\nIPMI Version : 2.0\n"
+        f"Aux Firmware Rev Info     : \n    {aux}\n    0x00\n    0x00\n    0x00\n"
+    )
+    return MagicMock(returncode=0, stdout=text, stderr="")
+
+
+class TestBmcVersionDecision:
+    """Old BMC: decided before any chip is reset. Mock only, 0 hardware tries."""
+
+    C9 = "Unable to send RAW command (rsp=0xc9): Parameter out of range"
+
+    def test_parse(self):
+        assert reset.parse_bmc_version(mc_info("0x23").stdout) == (0, 5, 23)
+        assert reset.parse_bmc_version(mc_info("0x21").stdout) == (0, 5, 21)
+        assert reset.parse_bmc_version("") is None
+
+    def test_old_bmc_no_flag_matches_main(self, glx):
+        fs, ioctl_calls = glx
+
+        def run(cmd, **kw):
+            if cmd[2:5] == ["raw", "0x30", "0x8B"]:
+                return fail(self.C9) if cmd[7] == "0x3" else ok()
+            return mc_info("0x21")
+
+        with patch("tt_smi.reset.subprocess.run", side_effect=run) as m:
+            with pytest.raises(SystemExit) as exc:
+                glx_6u_trays_reset(use_umd=True)
+        assert exc.value.code == 0
+        assert op_modes(m) == ["0x3", GLX_IPMI_OP_MODE_WITH_RETIMER]
+
+    def test_old_bmc_without_flag_decided_before_resets(self, glx, capsys):
+        fs, ioctl_calls = glx
+        with patch("tt_smi.reset.subprocess.run", side_effect=[mc_info("0x21")]):
+            with patch.object(
+                reset, "run_galaxy_ipmi_reset_with_bmc_retry", side_effect=SystemExit(0)
+            ) as retry:
+                with pytest.raises(SystemExit):
+                    glx_6u_trays_reset(use_umd=True)
+        assert retry.call_args[0][4] is True
+        assert "older than v0.05.22" in capsys.readouterr().out
+
+    def test_old_bmc_with_flag_reaches_op0(self, glx):
+        def run(cmd, **kw):
+            if cmd[2:5] == ["raw", "0x30", "0x8B"]:
+                return fail(self.C9) if cmd[7] == "0x3" else ok()
+            return mc_info("0x21")
+
+        with patch("tt_smi.reset.subprocess.run", side_effect=run) as m:
+            with pytest.raises(SystemExit):
+                glx_6u_trays_reset(use_umd=True, allow_legacy_retimer_reset=True)
+        assert op_modes(m)[-1] == GLX_IPMI_OP_MODE_WITH_RETIMER
+
+    def test_new_bmc_reaches_op3(self, glx):
+        with patch(
+            "tt_smi.reset.subprocess.run", side_effect=[mc_info("0x23"), ok()]
+        ) as m:
+            with pytest.raises(SystemExit):
+                glx_6u_trays_reset(use_umd=True)
+        assert op_modes(m) == ["0x3"]
+
+    def test_unparseable_version_warns_then_current_path(self, glx, capsys):
+        with patch("tt_smi.reset.subprocess.run", side_effect=[ok(), ok()]) as m:
+            with pytest.raises(SystemExit):
+                glx_6u_trays_reset(use_umd=True)
+        assert "version was not read" in capsys.readouterr().out
+        assert op_modes(m) == ["0x3"]
+
+
 class TestGlxResetFlow:
     def test_bmc_silent_resets_nothing(self, glx):
         fs, ioctl_calls = glx
