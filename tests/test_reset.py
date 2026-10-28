@@ -2532,9 +2532,7 @@ class TestRevFfAndUnopenedChips:
         reset_input = MagicMock(type=SmiDeviceTargetKind.ALL)
         with patch("tt_smi.reset.umd_pci_warm_reset"), patch(
             "tt_smi.reset.get_default_discovery_options"
-        ), patch(
-            "tt_smi.reset.TopologyDiscovery.discover", return_value=desc
-        ), patch(
+        ), patch("tt_smi.reset.TopologyDiscovery.discover", return_value=desc), patch(
             "tt_smi.reset._recover_after_failed_reinit", return_value=False
         ):
             with pytest.raises(SystemExit) as exc:
