@@ -48,9 +48,8 @@ from tt_tools_common.utils_common.tools_utils import (
 
 MINIMUM_DRIVER_VERSION_GALAXY_SECONDARY_BUS_RESET = "2.7.0"
 # BMC v0.05.22 adds op_mode 0x3: UBB reset without RST_RETIMER_PERST_N.
-# op_mode 0x0 is the legacy command that also asserts RST_RETIMER_PERST_N.
+# op_mode 0x0 (legacy, also asserts RST_RETIMER_PERST_N and resets NVMe retimers) is not used.
 MINIMUM_BMC_VERSION_NO_RETIMER_RESET = "0.05.22"
-GLX_IPMI_OP_MODE_WITH_RETIMER = "0x0"
 GLX_IPMI_OP_MODE_NO_RETIMER = "0x3"
 GLX_EXPECTED_CHIPS = 32
 GLX_EXIT_CHIPS_MISSING = 4
@@ -102,12 +101,12 @@ def run_galaxy_ipmi_reset(
     reset_time: str = "0xF",
 ) -> None:
     """
-    Issue the Galaxy UBB IPMI reset, preferring no-retimer op_mode 0x3.
+    Issue the Galaxy UBB IPMI reset with no-retimer op_mode 0x3.
 
     BMC firmware v0.05.22 or later accepts 0x3. Older BMCs reject it with
-    IPMI completion code 0xc9 (Parameter out of range) and do not reset.
-    Only on that 0xc9, print a warning and fall back to legacy op_mode 0x0
-    so the tray reset still goes through. Any other failure raises.
+    IPMI completion code 0xc9 (Parameter out of range): that raises with an
+    upgrade hint. There is no fallback to legacy op_mode 0x0, which also
+    resets the NVMe retimers and can drop the host's NVMe drives.
     """
     result = _run_ipmitool(
         _galaxy_ipmi_cmd(ubb_num, dev_num, op_mode, reset_time)
@@ -115,32 +114,12 @@ def run_galaxy_ipmi_reset(
     failure = _ipmi_failure_detail(result)
     if not failure:
         return
-
-    # Already on the legacy command (or a caller overrode op_mode): do not recurse.
-    if op_mode == GLX_IPMI_OP_MODE_WITH_RETIMER:
-        raise RuntimeError(f"IPMI command failed: {failure}")
-
     if _ipmi_output_is_param_out_of_range(failure):
-        print(
-            f"{CMD_LINE_COLOR.YELLOW}WARNING! "
-            f"This Galaxy is on BMC < v{MINIMUM_BMC_VERSION_NO_RETIMER_RESET}, "
-            "so reset without PCIe retimer (op_mode 0x3) is not supported. "
-            f"Upgrade BMC firmware to v{MINIMUM_BMC_VERSION_NO_RETIMER_RESET} or later to enable it.{CMD_LINE_COLOR.ENDC}\n"
-            f"{CMD_LINE_COLOR.BLUE}Falling back to legacy retimer reset (op_mode {GLX_IPMI_OP_MODE_WITH_RETIMER})...{CMD_LINE_COLOR.ENDC}"
+        failure += (
+            f" (BMC < v{MINIMUM_BMC_VERSION_NO_RETIMER_RESET} does not support "
+            "op_mode 0x3; upgrade BMC firmware)"
         )
-    else:
-        # Only 0xc9 means "old BMC"; anything else is a real failure, and the
-        # legacy op_mode would also reset the retimers.
-        raise RuntimeError(f"IPMI command failed: {failure}")
-
-    fallback = _run_ipmitool(
-        _galaxy_ipmi_cmd(
-            ubb_num, dev_num, GLX_IPMI_OP_MODE_WITH_RETIMER, reset_time
-        )
-    )
-    fallback_failure = _ipmi_failure_detail(fallback)
-    if fallback_failure:
-        raise RuntimeError(f"IPMI command failed: {fallback_failure}")
+    raise RuntimeError(f"IPMI command failed: {failure}")
 
 
 def should_use_secondary_bus_reset(is_galaxy: bool) -> bool:
