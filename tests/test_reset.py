@@ -373,3 +373,12 @@ class TestGalaxyReset:
 
             post_reset_devices = redetect_devices(use_umd)
             assert len(post_reset_devices) == len(pci_indices)
+
+
+def test_stuck_arc_heartbeat_is_not_alive(monkeypatch):
+    from tt_smi import reset
+
+    beats = {"0000:47:00.0": iter([1, 2]), "0000:c3:00.0": iter([5, 5])}
+    monkeypatch.setattr(reset, "_read_heartbeat", lambda chip, umd: next(beats[chip]))
+    monkeypatch.setattr(reset.time, "sleep", lambda s: None)
+    assert reset._alive_chips({b: b for b in beats}, True) == {"0000:47:00.0"}

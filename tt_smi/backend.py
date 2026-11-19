@@ -38,13 +38,11 @@ from tt_smi.utils import (
     bh_dram_training_passed,
     build_gddr_telemetry,
     BH_GDDR_BIST_FW_VERSION,
+    umd_telemetry_reader,
 )
 from tt_umd import (
     TTDevice,
-    wormhole,
-    TelemetryTag,
     ClusterDescriptor,
-    SmBusArcTelemetryReader,
     ARCH,
 )
 from tt_tools_common.utils_common.system_utils import (
@@ -344,15 +342,7 @@ class TTSMIBackend:
         """Update board info by reading SMBUS_TELEMETRY"""
         if self.use_umd:
             smbus_telem_dict = {}
-            arch = self.devices[board_num].get_arch()
-            if arch == ARCH.WORMHOLE_B0:
-                telem_reader = SmBusArcTelemetryReader(self.devices[board_num])
-                tag_collection = wormhole.TelemetryTag
-            elif arch == ARCH.BLACKHOLE:
-                telem_reader = self.devices[board_num].get_arc_telemetry_reader()
-                tag_collection = TelemetryTag
-            else:
-                raise ValueError(f"Unknown arch for device {board_num}")
+            telem_reader, tag_collection = umd_telemetry_reader(self.devices[board_num])
             
             for telem_key in tag_collection:
                 telem_value = hex(telem_reader.read_entry(telem_key.value)) if telem_reader.is_entry_available(telem_key.value) else None

@@ -25,6 +25,7 @@ from tt_smi.utils import (
     is_driver_version_at_least,
     IoctlResetFlags,
     reset_device_ioctl,
+    umd_telemetry_reader,
 )
 from tt_smi.constants import get_default_discovery_options
 from tt_smi.device_input import SmiDeviceInput, SmiDeviceTargetKind
@@ -407,6 +408,38 @@ def pci_board_reset(
             sys.exit(1)
 
 
+def _read_heartbeat(chip, use_umd: bool) -> int:
+    if use_umd:
+        reader, tags = umd_telemetry_reader(chip)
+        # WH has no TIMER_HEARTBEAT tag; its ARC0_HEALTH counter advances instead.
+        tag = getattr(tags, "TIMER_HEARTBEAT", None)
+        if tag is None:
+            tag = tags.ARC0_HEALTH
+        return reader.read_entry(tag.value)
+    if chip.as_bh():
+        return chip.as_bh().get_telemetry().timer_heartbeat
+    return chip.as_wh().get_telemetry().arc0_health
+
+
+def _alive_chips(chips_by_bdf: dict, use_umd: bool) -> set:
+    """BDFs whose ARC heartbeat advances within about a second."""
+    first = {}
+    for bdf, chip in chips_by_bdf.items():
+        try:
+            first[bdf] = _read_heartbeat(chip, use_umd)
+        except Exception as e:
+            print(f"{bdf}: heartbeat read failed: {e}")
+    time.sleep(1.5)
+    alive = set()
+    for bdf, value in first.items():
+        try:
+            if _read_heartbeat(chips_by_bdf[bdf], use_umd) != value:
+                alive.add(bdf)
+        except Exception as e:
+            print(f"{bdf}: heartbeat read failed: {e}")
+    return alive
+
+
 def glx_6u_trays_reset(
     reinit: bool = True,
     ubb_num: str = "0xF",
@@ -422,7 +455,7 @@ def glx_6u_trays_reset(
     2. Reset the trays with IPMI (op_mode 0x3, no PCIe retimer)
     3. Wait for 30s
     4. Perform POST_RESET ioctl on all chips
-    5. Reinit all chips
+    5. Reinit all chips and check that each chip's ARC heartbeat advances
 
     Args:
         reinit: Whether to reinitialize the chips after reset.
@@ -533,14 +566,15 @@ def glx_6u_trays_reset(
             options = get_default_discovery_options()
             options.discover_remote_devices = False
             options.wait_on_ethernet_link_training = False
-            _, devices = discover(options)
-            chip_count = len(devices)
+            cluster_descriptor, devices = discover(options)
+            bdfs = cluster_descriptor.get_chip_pci_bdfs()
+            chips_by_bdf = {bdfs[i]: chip for i, chip in devices.items()}
         else:
             os.environ["RUST_BACKTRACE"] = "full"
             chips = detect_chips_with_callback(
                 local_only=True, ignore_ethernet=True, print_status=print_status
             )
-            chip_count = len(chips)
+            chips_by_bdf = {chip.get_pci_bdf(): chip for chip in chips}
     except Exception as e:
         print(
             CMD_LINE_COLOR.RED,
@@ -549,9 +583,18 @@ def glx_6u_trays_reset(
         )
         sys.exit(1)
 
+    stuck = sorted(set(chips_by_bdf) - _alive_chips(chips_by_bdf, use_umd))
+    for bdf in stuck:
+        print(
+            CMD_LINE_COLOR.RED,
+            f"Error: chip {bdf}: ARC heartbeat does not advance after reset.",
+            CMD_LINE_COLOR.ENDC,
+        )
+    if stuck:
+        sys.exit(1)
     print(
         CMD_LINE_COLOR.GREEN,
-        f"Re-initialized {chip_count} boards after reset. Exiting...",
+        f"Re-initialized {len(chips_by_bdf)} boards after reset. Exiting...",
         CMD_LINE_COLOR.ENDC,
     )
     sys.exit(0)

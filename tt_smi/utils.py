@@ -15,7 +15,14 @@ from importlib.metadata import version
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from tt_tools_common.ui_common.themes import CMD_LINE_COLOR
-from tt_umd import TopologyDiscovery, TTDevice
+from tt_umd import (
+    ARCH,
+    SmBusArcTelemetryReader,
+    TelemetryTag,
+    TopologyDiscovery,
+    TTDevice,
+    wormhole,
+)
 
 from tt_smi import constants
 
@@ -555,6 +562,16 @@ def check_is_galaxy(backend, user_arg: str):
             CMD_LINE_COLOR.ENDC,
         )
         sys.exit(1)
+
+
+def umd_telemetry_reader(device: TTDevice):
+    """SMBus telemetry reader and tag enum of a UMD device, by arch."""
+    arch = device.get_arch()
+    if arch == ARCH.WORMHOLE_B0:
+        return SmBusArcTelemetryReader(device), wormhole.TelemetryTag
+    if arch == ARCH.BLACKHOLE:
+        return device.get_arc_telemetry_reader(), TelemetryTag
+    raise ValueError(f"Unknown arch {arch}")
 
 
 def is_vm() -> bool:
